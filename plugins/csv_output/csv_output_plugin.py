@@ -16,7 +16,7 @@ class Plugin(AIPlugin):
 
         # Init some basic parameters, like number of entries for a single file
         self.first_frame = True
-        self.lines_per_file = 10
+        self.lines_per_file = 1000
         self.lines_current = 0
         self.current_buffer = [] # List of telemetry points
         self.filename_preamble = "csv_out_"
@@ -46,9 +46,9 @@ class Plugin(AIPlugin):
         for layer in high_level_data.keys():
 
             for plugin in high_level_data[layer]:
-                plugin_output = high_level_data[layer].get(plugin, "empty")
+                plugin_output = high_level_data[layer].get(plugin, [])
                 # Assume each plugin is outputting a list
-                for telem_point in plugin_output:
+                for telem_point in (plugin_output or []):
                     self.current_buffer.append(str(telem_point))
                     
     def render_reasoning(self):

@@ -27,6 +27,17 @@ import message_headers as msg_hdr
 
 from onair.data_handling.parser_util import *
 
+def _ctypes_to_python(obj):
+    """Recursively convert a ctypes object to Python-native types.
+    Array of structs, array of arrays, and nested structs are all flattened
+    to nested Python lists of scalars (int/float/bytes)."""
+    if isinstance(obj, Array):
+        return [_ctypes_to_python(item) for item in obj]
+    elif isinstance(obj, Structure):
+        return [_ctypes_to_python(getattr(obj, f)) for f, _ in obj._fields_]
+    else:
+        return obj  # already a Python scalar (int, float, bytes)
+
 # Note: The double buffer does not clear between switching. If fresh data doesn't come in, stale data is returned (delayed by 1 frame)
 
 class DataSource(OnAirDataSource):
@@ -173,12 +184,14 @@ class DataSource(OnAirDataSource):
 
             for name in field_names:
                 idx = current_buffer['headers'].index(app_name + "." + name)
-                # Pull the data out of the message buy walking down the nested types
-                data = ""
+                # Pull the data out of the message by walking down the nested types
                 current_object = recv_msg
                 for sub_type in name.split('.'):
                     current_object = getattr(current_object, sub_type)
-                    data = str(current_object) # note does not work for arrays?
+                if isinstance(current_object, (Array, Structure)):
+                    data = _ctypes_to_python(current_object)
+                else:
+                    data = str(current_object)
                 current_buffer['data'][idx] = data
 
         with self.new_data_lock:
