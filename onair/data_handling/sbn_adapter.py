@@ -190,6 +190,11 @@ class DataSource(OnAirDataSource):
                     current_object = getattr(current_object, sub_type)
                 if isinstance(current_object, (Array, Structure)):
                     data = _ctypes_to_python(current_object)
+                elif isinstance(current_object, bytes):
+                    # ctypes c_char * N fields surface as bytes here (not Array).
+                    # Decode them once, stripping nul-padding, so downstream
+                    # consumers see clean text instead of "b'X'" reprs.
+                    data = current_object.rstrip(b'\x00').decode('utf-8', errors='replace')
                 else:
                     data = str(current_object)
                 current_buffer['data'][idx] = data
