@@ -16,8 +16,14 @@ Supports two pickle layouts:
     layout from the pre-per-scenario trainer; uses a single threshold.
 
 Returns `{"anomaly_score": float, "is_anomaly": bool, "scenario": str,
-"threshold": float}` from `render_reasoning()`. The csv_output plugin
-appends these as columns automatically.
+"threshold": float}` from `render_reasoning()`.
+
+`csv_output` runs as a knowledge_rep plugin so its `update()` never sees the
+learner's `high_level_data` (vehicle_rep calls `construct.update(frame)` with
+a single arg). To persist scores for offline analysis, this plugin writes a
+sibling side-file `iforest_out_<timestamp>_pid<N>.csv` next to the
+`csv_out_*.csv` rotations, joined by pid + cumulative row index. See
+`components/onair/training/loader.py::attach_iforest_scores`.
 
 Activation:
 1. Train: `python3 components/onair/training/train.py --per-scenario ...`
@@ -38,9 +44,11 @@ from __future__ import annotations
 
 import ast
 import configparser
+import csv
 import json
 import os
 import pickle
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -106,6 +114,14 @@ class Plugin(AIPlugin):
         "CalibrationPath": "",  # empty → derive as <model>.calibration.json
         "Scenario": "nominal_ops",  # which per-scenario IF to route through
         "AnomalyThreshold": "0.0",  # fallback if calibration missing
+        # Side-file writer: persists per-frame scores so offline tooling can
+        # join them to the sibling csv_out_*.csv. Default ON because the
+        # alternative is "scores live only in stdout."
+        "WriteSideFile": "true",
+        # Default mirrors csv_output's OutputDir; both plugins resolve relative
+        # to OnAIR cwd (fsw/build/exe/cpu1) at runtime.
+        "SideFileOutputDir": "../../../../data/onair/csv",
+        "SideFileFlushEvery": "10",  # rows buffered before each fsync-less append
     }
 
     def __init__(self, name, headers):
@@ -165,17 +181,41 @@ class Plugin(AIPlugin):
         self._latest_score: float | None = None
         self._latest_is_anomaly: bool = False
 
-        # Operational logging — until csv_output is rerouted through the
-        # complex-reasoning tier, this is the only way to observe the
-        # plugin's per-frame output online. Prints every N-th frame plus
-        # every anomaly transition.
+        # Operational logging — heartbeat every N-th frame plus every
+        # anomaly transition, so silence is distinguishable from "everything
+        # nominal." Persisted scores go to the side-file (below).
         self._frame_count = 0
         self._heartbeat_every = int(cfg.get("heartbeatevery", "100"))
         self._was_anomaly = False
 
+        # Side-file writer setup.
+        self._side_file_path: str | None = None
+        self._side_file_buffer: list[list[Any]] = []
+        self._side_file_header_written = False
+        self._side_file_flush_every = int(
+            cfg.get("sidefileflushevery", self.DEFAULTS["SideFileFlushEvery"])
+        )
+        write_side = cfg.get(
+            "writesidefile", self.DEFAULTS["WriteSideFile"]
+        ).strip().lower() == "true"
+        if write_side:
+            side_dir = cfg.get(
+                "sidefileoutputdir", self.DEFAULTS["SideFileOutputDir"]
+            )
+            os.makedirs(side_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
+            self._side_file_path = os.path.join(
+                side_dir, f"iforest_out_{ts}_pid{os.getpid()}.csv"
+            )
+
         print(f"[iforest] threshold={self.threshold:+.4f} "
               f"(score < threshold ⇒ anomaly), n_raw_features={self.n_raw}, "
               f"heartbeat every {self._heartbeat_every} frames")
+        if self._side_file_path is not None:
+            print(f"[iforest] side-file → {self._side_file_path} "
+                  f"(flush every {self._side_file_flush_every} rows)")
+        else:
+            print("[iforest] side-file writer disabled")
 
     @staticmethod
     def _load_config() -> dict:
@@ -253,13 +293,15 @@ class Plugin(AIPlugin):
         self._latest_score = score
         self._latest_is_anomaly = is_anomaly
         self._frame_count += 1
+        alert = is_anomaly and not self._was_anomaly
+        cleared = self._was_anomaly and not is_anomaly
         # Edge-triggered alert on transitions, plus a heartbeat so silence
         # is distinguishable from "plugin alive but everything nominal".
-        if is_anomaly and not self._was_anomaly:
+        if alert:
             print(f"[iforest][ALERT] frame={self._frame_count} "
                   f"scenario={self.scenario} score={score:+.4f} "
                   f"threshold={self.threshold:+.4f} (entered anomaly)")
-        elif self._was_anomaly and not is_anomaly:
+        elif cleared:
             print(f"[iforest][CLEAR] frame={self._frame_count} "
                   f"scenario={self.scenario} score={score:+.4f} "
                   f"(left anomaly)")
@@ -268,6 +310,38 @@ class Plugin(AIPlugin):
                   f"scenario={self.scenario} score={score:+.4f} "
                   f"is_anomaly={is_anomaly}")
         self._was_anomaly = is_anomaly
+
+        if self._side_file_path is not None:
+            # frame_idx is 0-indexed so it lines up with csv_output's __row_idx
+            # cumulative across same-pid rotations; printed log frames remain
+            # 1-indexed (`self._frame_count`) for human readability.
+            self._side_file_buffer.append([
+                self._frame_count - 1,
+                self.scenario,
+                f"{score:.6f}",
+                f"{self.threshold:.6f}",
+                int(is_anomaly),
+                int(alert),
+                int(cleared),
+            ])
+            if len(self._side_file_buffer) >= self._side_file_flush_every:
+                self._flush_side_file()
+
+    def _flush_side_file(self) -> None:
+        """Append buffered side-file rows; first flush emits the header."""
+        if self._side_file_path is None or not self._side_file_buffer:
+            return
+        write_header = not self._side_file_header_written
+        with open(self._side_file_path, "a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow([
+                    "frame_idx", "scenario", "score", "threshold",
+                    "is_anomaly", "alert", "cleared",
+                ])
+                self._side_file_header_written = True
+            w.writerows(self._side_file_buffer)
+        self._side_file_buffer.clear()
 
     def render_reasoning(self):
         if self._latest_score is None:
