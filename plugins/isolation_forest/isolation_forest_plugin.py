@@ -1,27 +1,44 @@
 # GSC-19165-1, "The On-Board Artificial Intelligence Research (OnAIR) Platform"
 # Licensed under the NASA Open Source Agreement version 1.3
-"""Isolation Forest Learner plugin (Tier 1 — sketch, not yet registered).
+"""Isolation Forest Learner plugin (Tier 1).
 
 Loads a pickled IsolationForest + feature schema produced by
 `components/onair/training/train.py` and scores each incoming frame.
 
-To activate:
-1. Train: `python3 components/onair/training/train.py`
-2. Add to `nos3_security.ini`:
-       LearnersPluginDict = {'iforest': 'cf/onair/plugins/isolation_forest/__init__.py'}
-3. Add the model path under [ISOLATION_FOREST]:
-       ModelPath = data/onair/models/iforest_v1.pkl
-4. Re-run the OnAIR build/sync (CMakeLists copies plugins to fsw/build/exe/cpu1/cf/onair/plugins/)
+Supports two pickle layouts:
 
-Returns `{"anomaly_score": float, "is_anomaly": bool}` from render_reasoning().
-The csv_output plugin will append these as additional columns when the learner
-is in `LearnersPluginDict`.
+  - **Per-scenario** (`{"models": {scn: IF, ...}, "schema": {...}, ...}`):
+    the plugin routes each frame through `models[scenario]` based on the
+    `Scenario` config option, and uses a per-scenario threshold loaded
+    from `<model>.calibration.json` (output of
+    `components/onair/training/calibrate.py`). This is the v2/v3 layout.
+  - **Single-model** (`{"model": IF, "schema": {...}, ...}`): legacy
+    layout from the pre-per-scenario trainer; uses a single threshold.
+
+Returns `{"anomaly_score": float, "is_anomaly": bool, "scenario": str,
+"threshold": float}` from `render_reasoning()`. The csv_output plugin
+appends these as columns automatically.
+
+Activation:
+1. Train: `python3 components/onair/training/train.py --per-scenario ...`
+2. Calibrate: `python3 components/onair/training/calibrate.py --model <pkl> --manifest <baselines>`
+3. `nos3_security.ini`:
+       LearnersPluginDict = {'iforest': 'cf/onair/plugins/isolation_forest/__init__.py'}
+
+       [ISOLATION_FOREST]
+       ModelPath = data/onair/models/iforest_per_scenario_v3_multiuptime.pkl
+       CalibrationPath = data/onair/models/iforest_per_scenario_v3_multiuptime.calibration.json
+       Scenario = nominal_ops
+       AnomalyThreshold = 0.0   # fallback if calibration missing for the scenario
+4. Sync: re-run the OnAIR build (CMakeLists copies plugins to fsw/build/exe/cpu1/cf/onair/plugins/)
+   plus the model + calibration JSON into a path accessible at runtime cwd.
 """
 
 from __future__ import annotations
 
 import ast
 import configparser
+import json
 import os
 import pickle
 from typing import Any
@@ -85,8 +102,10 @@ class Plugin(AIPlugin):
     """
 
     DEFAULTS = {
-        "ModelPath": "data/onair/models/iforest_v1.pkl",
-        "AnomalyThreshold": "0.0",  # decision_function < threshold → anomaly
+        "ModelPath": "data/onair/models/iforest_per_scenario_v3_multiuptime.pkl",
+        "CalibrationPath": "",  # empty → derive as <model>.calibration.json
+        "Scenario": "nominal_ops",  # which per-scenario IF to route through
+        "AnomalyThreshold": "0.0",  # fallback if calibration missing
     }
 
     def __init__(self, name, headers):
@@ -94,20 +113,47 @@ class Plugin(AIPlugin):
 
         cfg = self._load_config()
         self.model_path = cfg.get("modelpath", self.DEFAULTS["ModelPath"])
-        self.threshold = float(cfg.get("anomalythreshold", self.DEFAULTS["AnomalyThreshold"]))
+        cal_path = cfg.get("calibrationpath", self.DEFAULTS["CalibrationPath"]).strip()
+        if not cal_path:
+            cal_path = self.model_path.removesuffix(".pkl") + ".calibration.json"
+        self.calibration_path = cal_path
+        self.scenario = cfg.get("scenario", self.DEFAULTS["Scenario"])
+        fallback_threshold = float(cfg.get("anomalythreshold", self.DEFAULTS["AnomalyThreshold"]))
 
         with open(self.model_path, "rb") as f:
             artifact = pickle.load(f)
-        self.model = artifact["model"]
-        self.schema = artifact["schema"]
-        self.include_deltas = artifact["config"]["include_deltas"]
 
-        # Build header index for fast frame -> feature mapping.
+        self.schema = artifact["schema"]
+        self.include_deltas = artifact.get("config", {}).get("include_deltas", True)
+
+        # Per-scenario layout takes precedence; legacy single-model is fallback.
+        if "models" in artifact:
+            models = artifact["models"]
+            if self.scenario not in models:
+                raise ValueError(
+                    f"Scenario {self.scenario!r} not in pickle; "
+                    f"available: {sorted(models)}"
+                )
+            self.model = models[self.scenario]
+            print(f"[iforest] per-scenario layout, routing through {self.scenario!r} IF "
+                  f"({len(models)} models in pickle)")
+        elif "model" in artifact:
+            self.model = artifact["model"]
+            print(f"[iforest] single-model layout, scenario={self.scenario!r} (advisory)")
+        else:
+            raise ValueError(f"{self.model_path}: no 'models' or 'model' key in pickle")
+
+        # Calibration: per-scenario threshold from calibrate.py output. Falls
+        # back to AnomalyThreshold when the file is missing or the scenario
+        # entry is missing/null.
+        self.threshold = self._load_threshold(self.scenario, fallback_threshold)
+
+        # Build header index for fast frame -> feature mapping. Schema is
+        # frozen at training time; column-type drift in scoring data can't
+        # change feature count.
         self._header_to_idx = {h: i for i, h in enumerate(headers)}
         self._scalar_indices = [self._header_to_idx[c] for c in self.schema["scalar_columns"]
                                 if c in self._header_to_idx]
-        # List columns: each entry is (frame_idx, paths) so we can extract leaves
-        # in the canonical order recorded at training time.
         self._list_columns: list[tuple[int, list[list[int]]]] = []
         for col, layout in self.schema["list_columns"].items():
             if col not in self._header_to_idx:
@@ -119,6 +165,18 @@ class Plugin(AIPlugin):
         self._latest_score: float | None = None
         self._latest_is_anomaly: bool = False
 
+        # Operational logging — until csv_output is rerouted through the
+        # complex-reasoning tier, this is the only way to observe the
+        # plugin's per-frame output online. Prints every N-th frame plus
+        # every anomaly transition.
+        self._frame_count = 0
+        self._heartbeat_every = int(cfg.get("heartbeatevery", "100"))
+        self._was_anomaly = False
+
+        print(f"[iforest] threshold={self.threshold:+.4f} "
+              f"(score < threshold ⇒ anomaly), n_raw_features={self.n_raw}, "
+              f"heartbeat every {self._heartbeat_every} frames")
+
     @staticmethod
     def _load_config() -> dict:
         ini_path = os.environ.get("ONAIR_INI_FILE") or "cf/onair/nos3_security.ini"
@@ -129,6 +187,31 @@ class Plugin(AIPlugin):
         if parser.has_section("ISOLATION_FOREST"):
             return dict(parser.items("ISOLATION_FOREST"))
         return {}
+
+    def _load_threshold(self, scenario: str, fallback: float) -> float:
+        if not os.path.exists(self.calibration_path):
+            print(f"[iforest] WARNING: calibration file not found at "
+                  f"{self.calibration_path}; using AnomalyThreshold fallback "
+                  f"{fallback:+.4f}")
+            return fallback
+        try:
+            with open(self.calibration_path) as f:
+                cal = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[iforest] WARNING: could not read calibration {self.calibration_path}: {e}; "
+                  f"using AnomalyThreshold fallback {fallback:+.4f}")
+            return fallback
+        thr = (cal.get("thresholds") or {}).get(scenario)
+        if thr is None:
+            print(f"[iforest] WARNING: no calibrated threshold for scenario "
+                  f"{scenario!r} in {self.calibration_path}; using "
+                  f"AnomalyThreshold fallback {fallback:+.4f}")
+            return fallback
+        target = cal.get("target_fp_rate")
+        target_str = f" (calibrated @ FP={target*100:.1f}%)" if isinstance(target, (int, float)) else ""
+        print(f"[iforest] loaded calibrated threshold for {scenario!r}: "
+              f"{thr:+.4f}{target_str}")
+        return float(thr)
 
     def _frame_to_raw(self, frame) -> np.ndarray:
         """Build the raw (pre-delta) feature vector from one telemetry frame."""
@@ -166,13 +249,35 @@ class Plugin(AIPlugin):
 
         self.prev_raw = raw
         score = float(self.model.decision_function(features.reshape(1, -1))[0])
+        is_anomaly = score < self.threshold
         self._latest_score = score
-        self._latest_is_anomaly = score < self.threshold
+        self._latest_is_anomaly = is_anomaly
+        self._frame_count += 1
+        # Edge-triggered alert on transitions, plus a heartbeat so silence
+        # is distinguishable from "plugin alive but everything nominal".
+        if is_anomaly and not self._was_anomaly:
+            print(f"[iforest][ALERT] frame={self._frame_count} "
+                  f"scenario={self.scenario} score={score:+.4f} "
+                  f"threshold={self.threshold:+.4f} (entered anomaly)")
+        elif self._was_anomaly and not is_anomaly:
+            print(f"[iforest][CLEAR] frame={self._frame_count} "
+                  f"scenario={self.scenario} score={score:+.4f} "
+                  f"(left anomaly)")
+        elif self._heartbeat_every > 0 and self._frame_count % self._heartbeat_every == 0:
+            print(f"[iforest] frame={self._frame_count} "
+                  f"scenario={self.scenario} score={score:+.4f} "
+                  f"is_anomaly={is_anomaly}")
+        self._was_anomaly = is_anomaly
 
     def render_reasoning(self):
         if self._latest_score is None:
-            return {"anomaly_score": 0.0, "is_anomaly": False}
+            return {
+                "anomaly_score": 0.0, "is_anomaly": False,
+                "scenario": self.scenario, "threshold": self.threshold,
+            }
         return {
             "anomaly_score": self._latest_score,
             "is_anomaly": self._latest_is_anomaly,
+            "scenario": self.scenario,
+            "threshold": self.threshold,
         }

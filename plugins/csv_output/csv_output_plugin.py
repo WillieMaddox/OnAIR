@@ -92,7 +92,14 @@ class Plugin(AIPlugin):
         return os.path.join(self.output_dir, name)
 
     def update(self, low_level_data=[], high_level_data={}):
-        """Stage one telemetry frame; high-level plugin names are appended to headers once."""
+        """Stage one telemetry frame; high-level plugin names are appended to headers once.
+
+        Note: csv_output runs as a knowledge_rep plugin, so vehicle_rep calls
+        construct.update(frame) with a single arg — high_level_data is always
+        the empty default dict here. Capturing learner outputs into the CSV
+        therefore requires either moving csv_output to the complex-reasoning
+        tier or adding a separate side-file writer; see the IF plugin notes.
+        """
         if not self.headers_built:
             for layer in high_level_data.keys():
                 for plugin in high_level_data[layer]:
