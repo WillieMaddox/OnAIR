@@ -122,6 +122,19 @@ class Plugin(AIPlugin):
         # to OnAIR cwd (fsw/build/exe/cpu1) at runtime.
         "SideFileOutputDir": "../../../../data/onair/csv",
         "SideFileFlushEvery": "10",  # rows buffered before each fsync-less append
+        # Startup-transient suppression. Training uses --skip-warmup-rows 30
+        # because the first ~30 frames after OnAIR connects have not-yet-
+        # arrived MIDs (placeholder values + huge first-arrival deltas) that
+        # the model treats as anomalous. During warmup we still record raw
+        # score / is_anomaly to the side-file but never raise ALERT / CLEAR.
+        "WarmupFrames": "30",
+        # Hysteresis: require N consecutive anomaly (resp. nominal) frames
+        # before the operational state transitions. Kills 1-frame spikes
+        # like yesterday's "ALERT frame=N / CLEAR frame=N+1" pattern; the
+        # 6s cmd-injection window (≈30 frames at 5 Hz) leaves plenty of
+        # headroom for N=2. Raw is_anomaly in the side-file is unaffected.
+        "AlertHysteresis": "2",
+        "ClearHysteresis": "2",
     }
 
     def __init__(self, name, headers):
@@ -186,6 +199,17 @@ class Plugin(AIPlugin):
         # nominal." Persisted scores go to the side-file (below).
         self._frame_count = 0
         self._heartbeat_every = int(cfg.get("heartbeatevery", "100"))
+
+        # Warmup + hysteresis state.
+        #   _alert_active tracks the *operational* alert state (post-
+        #   warmup, post-hysteresis). _was_anomaly tracks the raw per-frame
+        #   is_anomaly used for side-file alert/cleared edge bits.
+        self._warmup_frames = int(cfg.get("warmupframes", self.DEFAULTS["WarmupFrames"]))
+        self._alert_hyst = max(1, int(cfg.get("alerthysteresis", self.DEFAULTS["AlertHysteresis"])))
+        self._clear_hyst = max(1, int(cfg.get("clearhysteresis", self.DEFAULTS["ClearHysteresis"])))
+        self._consec_anomaly = 0
+        self._consec_nominal = 0
+        self._alert_active = False
         self._was_anomaly = False
 
         # Side-file writer setup.
@@ -211,6 +235,8 @@ class Plugin(AIPlugin):
         print(f"[iforest] threshold={self.threshold:+.4f} "
               f"(score < threshold ⇒ anomaly), n_raw_features={self.n_raw}, "
               f"heartbeat every {self._heartbeat_every} frames")
+        print(f"[iforest] warmup={self._warmup_frames} frames, "
+              f"hysteresis alert/clear={self._alert_hyst}/{self._clear_hyst}")
         if self._side_file_path is not None:
             print(f"[iforest] side-file → {self._side_file_path} "
                   f"(flush every {self._side_file_flush_every} rows)")
@@ -293,28 +319,56 @@ class Plugin(AIPlugin):
         self._latest_score = score
         self._latest_is_anomaly = is_anomaly
         self._frame_count += 1
-        alert = is_anomaly and not self._was_anomaly
-        cleared = self._was_anomaly and not is_anomaly
+
+        # Operational alert state machine: warmup suppresses transitions
+        # entirely AND keeps the hysteresis counters at zero, so the first
+        # post-warmup anomaly frame is counted as `consec=1` rather than
+        # inheriting a tall warmup-era streak that would fire ALERT on the
+        # very next frame. alert/cleared edge bits and the [ALERT]/[CLEAR]
+        # log lines reflect the *operational* state, not the raw per-frame
+        # is_anomaly (which is preserved verbatim in the side-file for
+        # offline analysis).
+        in_warmup = self._frame_count <= self._warmup_frames
+        alert = False
+        cleared = False
+        if not in_warmup:
+            if is_anomaly:
+                self._consec_anomaly += 1
+                self._consec_nominal = 0
+            else:
+                self._consec_nominal += 1
+                self._consec_anomaly = 0
+            if not self._alert_active and self._consec_anomaly >= self._alert_hyst:
+                self._alert_active = True
+                alert = True
+            elif self._alert_active and self._consec_nominal >= self._clear_hyst:
+                self._alert_active = False
+                cleared = True
+
         # Edge-triggered alert on transitions, plus a heartbeat so silence
         # is distinguishable from "plugin alive but everything nominal".
         if alert:
             print(f"[iforest][ALERT] frame={self._frame_count} "
                   f"scenario={self.scenario} score={score:+.4f} "
-                  f"threshold={self.threshold:+.4f} (entered anomaly)")
+                  f"threshold={self.threshold:+.4f} "
+                  f"(entered anomaly after {self._alert_hyst} consec frames)")
         elif cleared:
             print(f"[iforest][CLEAR] frame={self._frame_count} "
                   f"scenario={self.scenario} score={score:+.4f} "
-                  f"(left anomaly)")
+                  f"(left anomaly after {self._clear_hyst} consec nominal frames)")
         elif self._heartbeat_every > 0 and self._frame_count % self._heartbeat_every == 0:
-            print(f"[iforest] frame={self._frame_count} "
+            tag = " [warmup]" if in_warmup else ""
+            print(f"[iforest] frame={self._frame_count}{tag} "
                   f"scenario={self.scenario} score={score:+.4f} "
-                  f"is_anomaly={is_anomaly}")
+                  f"is_anomaly={is_anomaly} alert_active={self._alert_active}")
         self._was_anomaly = is_anomaly
 
         if self._side_file_path is not None:
             # frame_idx is 0-indexed so it lines up with csv_output's __row_idx
             # cumulative across same-pid rotations; printed log frames remain
-            # 1-indexed (`self._frame_count`) for human readability.
+            # 1-indexed (`self._frame_count`) for human readability. is_anomaly
+            # is the raw decision; alert/cleared encode the operational
+            # (warmup+hysteresis-gated) transition for the offline record.
             self._side_file_buffer.append([
                 self._frame_count - 1,
                 self.scenario,
