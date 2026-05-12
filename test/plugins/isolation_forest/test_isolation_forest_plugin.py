@@ -54,16 +54,24 @@ def configured(tmp_path, monkeypatch):
                heartbeat: int = 0,
                warmup_frames: int = 0,
                alert_hysteresis: int = 1,
-               clear_hysteresis: int = 1):
+               clear_hysteresis: int = 1,
+               recal_enabled: str = "false",
+               recal_window: int = 9000,
+               recal_interval: int = 1500,
+               recal_max_delta_pct: float = 50.0,
+               target_fp_rate: float | None = None):
         pkl = tmp_path / "m.pkl"
         with open(pkl, "wb") as f:
             pickle.dump(_make_artifact(score=score), f)
         cal = tmp_path / "m.calibration.json"
-        cal.write_text(json.dumps({"thresholds": {"nominal_ops": threshold}}))
+        cal_obj: dict = {"thresholds": {"nominal_ops": threshold}}
+        if target_fp_rate is not None:
+            cal_obj["target_fp_rate"] = target_fp_rate
+        cal.write_text(json.dumps(cal_obj))
         ini = tmp_path / "test.ini"
         # Default the gating *off* so existing tests of edge-bit / flush
-        # behavior aren't accidentally suppressed; warmup + hysteresis get
-        # exercised by dedicated tests below.
+        # behavior aren't accidentally suppressed; warmup + hysteresis +
+        # recalibration get exercised by dedicated tests below.
         ini.write_text(
             "[ISOLATION_FOREST]\n"
             f"ModelPath = {pkl}\n"
@@ -76,6 +84,10 @@ def configured(tmp_path, monkeypatch):
             f"WarmupFrames = {warmup_frames}\n"
             f"AlertHysteresis = {alert_hysteresis}\n"
             f"ClearHysteresis = {clear_hysteresis}\n"
+            f"RecalibrationEnabled = {recal_enabled}\n"
+            f"RecalibrationWindowFrames = {recal_window}\n"
+            f"RecalibrationIntervalFrames = {recal_interval}\n"
+            f"RecalibrationMaxDeltaPct = {recal_max_delta_pct}\n"
         )
         monkeypatch.setenv("ONAIR_INI_FILE", str(ini))
         return IF_Plugin(MagicMock(), ["foo", "bar"])
@@ -239,6 +251,116 @@ def test_alert_hysteresis_fires_after_n_consecutive(configured, tmp_path):
     assert alerts == ["0", "1", "0", "0", "0", "0"]
     assert cleareds == ["0", "0", "0", "0", "0", "1"]
     assert plugin._alert_active is False
+
+
+def test_recalibration_disabled_by_default_leaves_threshold_alone(configured, tmp_path):
+    """No buffer fill, no JSON write, threshold doesn't drift when the
+    feature is off. Default behavior must be byte-identical to pre-#4."""
+    plugin = configured(score=-0.1, threshold=0.0, flush_every=10,
+                        recal_enabled="false", target_fp_rate=0.01,
+                        recal_window=5, recal_interval=5)
+    for _ in range(20):
+        plugin.update(low_level_data=["1.0", "2.0"])
+    # Buffer is empty (not accumulating); threshold unchanged.
+    assert len(plugin._recal_scores) == 0
+    assert plugin.threshold == 0.0
+    # Calibration JSON also unchanged — read it and confirm no metadata leak.
+    cal_path = plugin.calibration_path
+    with open(cal_path) as f:
+        cal = json.load(f)
+    assert cal["thresholds"]["nominal_ops"] == 0.0
+    assert "last_recalibration_utc" not in cal
+
+
+def test_recalibration_writes_percentile_threshold_back_to_json(configured, tmp_path):
+    """When enabled and the window is quiet, the new threshold equals the
+    Pth percentile of the window's scores (P = 100 * target_fp_rate) —
+    and shows up in the calibration JSON atomically."""
+    # target_fp_rate 50% picks the median, which makes the expected
+    # threshold easy to reason about against a uniform synthetic stream.
+    plugin = configured(score=0.0, threshold=0.10, flush_every=1,
+                        warmup_frames=0, alert_hysteresis=1, clear_hysteresis=1,
+                        recal_enabled="true", target_fp_rate=0.5,
+                        recal_window=5, recal_interval=5,
+                        recal_max_delta_pct=10000.0)  # effectively no clamp
+
+    scores = [0.20, 0.30, 0.40, 0.50, 0.60]  # median = 0.40
+    for s in scores:
+        plugin.model.score = s
+        plugin.update(low_level_data=["1.0", "2.0"])
+
+    # The window's median (0.40) becomes the new threshold; persisted.
+    assert plugin.threshold == pytest.approx(0.40)
+    with open(plugin.calibration_path) as f:
+        cal = json.load(f)
+    assert cal["thresholds"]["nominal_ops"] == pytest.approx(0.40)
+    assert cal["last_recalibration_scenario"] == "nominal_ops"
+    assert cal["last_recalibration_window_frames"] == 5
+    # ISO 8601 UTC timestamp present and well-formed.
+    assert cal["last_recalibration_utc"].endswith("+00:00")
+
+
+def test_recalibration_clamp_limits_per_attempt_shift(configured, tmp_path):
+    """A proposed shift larger than MaxDeltaPct gets clamped to that
+    fraction of |current threshold|. Prevents one bad window from blowing
+    up the threshold; subsequent attempts converge."""
+    plugin = configured(score=0.0, threshold=0.10, flush_every=1,
+                        warmup_frames=0, alert_hysteresis=1, clear_hysteresis=1,
+                        recal_enabled="true", target_fp_rate=0.5,
+                        recal_window=3, recal_interval=3,
+                        recal_max_delta_pct=10.0)  # ±10% of |0.10| = ±0.01
+
+    # Median of stream = 0.50; proposed Δ = +0.40, clamp ±0.01 → new = 0.11.
+    for s in [0.40, 0.50, 0.60]:
+        plugin.model.score = s
+        plugin.update(low_level_data=["1.0", "2.0"])
+
+    assert plugin.threshold == pytest.approx(0.11)
+
+
+def test_recalibration_skipped_when_alert_in_window(configured, tmp_path):
+    """An attack period in the rolling window must NOT slide the threshold
+    — otherwise the recalibrator would learn to permit the very condition
+    that raised the alarm (slow-drip attack failure mode)."""
+    plugin = configured(score=-0.10, threshold=0.00, flush_every=1,
+                        warmup_frames=0, alert_hysteresis=1, clear_hysteresis=1,
+                        recal_enabled="true", target_fp_rate=0.01,
+                        recal_window=4, recal_interval=4,
+                        recal_max_delta_pct=10000.0)
+
+    # First frame: anom → ALERT (alert_active=True).
+    plugin.update(low_level_data=["1.0", "2.0"])
+    assert plugin._alert_active is True
+    plugin.model.score = 0.1  # nominal for the rest of the window
+    plugin.update(low_level_data=["1.0", "2.0"])
+    plugin.update(low_level_data=["1.0", "2.0"])
+    plugin.update(low_level_data=["1.0", "2.0"])  # 4th frame: triggers attempt
+
+    # Threshold unchanged because at least one window frame had alert_active=True.
+    assert plugin.threshold == 0.0
+    assert plugin._recal_attempt_count == 1  # the attempt ran...
+    with open(plugin.calibration_path) as f:
+        cal = json.load(f)
+    # ...but no persistence happened.
+    assert "last_recalibration_utc" not in cal
+    assert cal["thresholds"]["nominal_ops"] == 0.0
+
+
+def test_recalibration_skipped_when_target_fp_rate_missing(configured, tmp_path):
+    """Without a calibrated target_fp_rate in the JSON, the recalibrator
+    has no percentile to aim for and must bail out rather than guess."""
+    plugin = configured(score=0.0, threshold=0.10, flush_every=1,
+                        warmup_frames=0, alert_hysteresis=1, clear_hysteresis=1,
+                        recal_enabled="true", target_fp_rate=None,
+                        recal_window=3, recal_interval=3,
+                        recal_max_delta_pct=10000.0)
+
+    for s in [0.20, 0.30, 0.40]:
+        plugin.model.score = s
+        plugin.update(low_level_data=["1.0", "2.0"])
+
+    assert plugin.threshold == 0.10  # unchanged
+    assert plugin._recal_attempt_count == 1
 
 
 def test_warmup_does_not_leak_streak_into_post_warmup_hysteresis(configured, tmp_path):

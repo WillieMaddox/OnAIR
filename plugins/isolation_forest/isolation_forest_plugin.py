@@ -48,7 +48,8 @@ import csv
 import json
 import os
 import pickle
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -135,6 +136,28 @@ class Plugin(AIPlugin):
         # headroom for N=2. Raw is_anomaly in the side-file is unaffected.
         "AlertHysteresis": "2",
         "ClearHysteresis": "2",
+        # Periodic threshold recalibration. v3 calibration was a point-in-
+        # time snapshot; long-uptime stack drift pushes the operational FP
+        # rate above target. When enabled, the plugin keeps a rolling
+        # window of recent scores, and every RecalibrationIntervalFrames
+        # frames recomputes the threshold as the Pth percentile of that
+        # window (P = target_fp_rate from the calibration JSON). The new
+        # threshold is persisted back to the calibration JSON atomically.
+        # Off by default — opt-in via ini so the safety semantics (clamp,
+        # alert-active gate) get reviewed before they touch operations.
+        "RecalibrationEnabled": "false",
+        # Window length. 9000 frames ≈ 30 min at the live ~5 Hz cadence,
+        # long enough to dwarf any plausible attack duration so outlier
+        # filtering by percentile is robust.
+        "RecalibrationWindowFrames": "9000",
+        # How often the plugin attempts recalibration once the window is
+        # full. 1500 ≈ 5 min between attempts; bounds how fast the
+        # threshold can crawl without flooding the calibration JSON.
+        "RecalibrationIntervalFrames": "1500",
+        # Per-attempt clamp on |threshold shift|, as a percentage of the
+        # current threshold's magnitude. Prevents one bad recalibration
+        # from blowing up the threshold; multiple attempts converge.
+        "RecalibrationMaxDeltaPct": "50",
     }
 
     def __init__(self, name, headers):
@@ -212,6 +235,25 @@ class Plugin(AIPlugin):
         self._alert_active = False
         self._was_anomaly = False
 
+        # Recalibration state. Off by default so the safety semantics are
+        # explicit. The two parallel deques (scores + alert_active) let the
+        # recalibrator skip windows that overlap a latched alert — without
+        # that gate, an attack period would contaminate the nominal sample
+        # and slide the threshold to permit similar attacks.
+        self._recal_enabled = cfg.get(
+            "recalibrationenabled", self.DEFAULTS["RecalibrationEnabled"]
+        ).strip().lower() == "true"
+        self._recal_window = max(1, int(cfg.get(
+            "recalibrationwindowframes", self.DEFAULTS["RecalibrationWindowFrames"])))
+        self._recal_interval = max(1, int(cfg.get(
+            "recalibrationintervalframes", self.DEFAULTS["RecalibrationIntervalFrames"])))
+        self._recal_max_delta_pct = float(cfg.get(
+            "recalibrationmaxdeltapct", self.DEFAULTS["RecalibrationMaxDeltaPct"]))
+        self._recal_scores: deque[float] = deque(maxlen=self._recal_window)
+        self._recal_alert_in_window: deque[bool] = deque(maxlen=self._recal_window)
+        self._recal_frames_since = 0
+        self._recal_attempt_count = 0
+
         # Side-file writer setup.
         self._side_file_path: str | None = None
         self._side_file_buffer: list[list[Any]] = []
@@ -237,6 +279,12 @@ class Plugin(AIPlugin):
               f"heartbeat every {self._heartbeat_every} frames")
         print(f"[iforest] warmup={self._warmup_frames} frames, "
               f"hysteresis alert/clear={self._alert_hyst}/{self._clear_hyst}")
+        if self._recal_enabled:
+            tfp = (f"{self._target_fp_rate*100:.2f}%"
+                   if self._target_fp_rate is not None else "MISSING")
+            print(f"[iforest] recalibration ENABLED: window={self._recal_window} "
+                  f"frames, interval={self._recal_interval} frames, "
+                  f"clamp=±{self._recal_max_delta_pct:.0f}%, target FP={tfp}")
         if self._side_file_path is not None:
             print(f"[iforest] side-file → {self._side_file_path} "
                   f"(flush every {self._side_file_flush_every} rows)")
@@ -255,6 +303,7 @@ class Plugin(AIPlugin):
         return {}
 
     def _load_threshold(self, scenario: str, fallback: float) -> float:
+        self._target_fp_rate: float | None = None
         if not os.path.exists(self.calibration_path):
             print(f"[iforest] WARNING: calibration file not found at "
                   f"{self.calibration_path}; using AnomalyThreshold fallback "
@@ -274,6 +323,8 @@ class Plugin(AIPlugin):
                   f"AnomalyThreshold fallback {fallback:+.4f}")
             return fallback
         target = cal.get("target_fp_rate")
+        if isinstance(target, (int, float)):
+            self._target_fp_rate = float(target)
         target_str = f" (calibrated @ FP={target*100:.1f}%)" if isinstance(target, (int, float)) else ""
         print(f"[iforest] loaded calibrated threshold for {scenario!r}: "
               f"{thr:+.4f}{target_str}")
@@ -380,6 +431,96 @@ class Plugin(AIPlugin):
             ])
             if len(self._side_file_buffer) >= self._side_file_flush_every:
                 self._flush_side_file()
+
+        if self._recal_enabled:
+            self._recal_scores.append(score)
+            self._recal_alert_in_window.append(self._alert_active)
+            self._recal_frames_since += 1
+            if (self._recal_frames_since >= self._recal_interval
+                    and len(self._recal_scores) >= self._recal_window):
+                self._try_recalibrate()
+                self._recal_frames_since = 0
+
+    def _try_recalibrate(self) -> None:
+        """Recompute the threshold from the rolling nominal window, if safe.
+
+        Skipped when: target_fp_rate is missing from the calibration JSON,
+        or any frame in the window had `alert_active=True` (the window
+        overlaps a latched alarm — counts the alarm scores as nominal,
+        which would slide the threshold to permit the very condition that
+        raised it). Otherwise picks the Pth percentile as the new
+        threshold and clamps the per-attempt shift to MaxDeltaPct.
+        """
+        self._recal_attempt_count += 1
+        if self._target_fp_rate is None:
+            print(f"[iforest][recal] attempt {self._recal_attempt_count} skipped: "
+                  f"target_fp_rate missing from calibration JSON")
+            return
+        if any(self._recal_alert_in_window):
+            n_alerted = sum(1 for a in self._recal_alert_in_window if a)
+            print(f"[iforest][recal] attempt {self._recal_attempt_count} skipped: "
+                  f"alert_active was True on {n_alerted}/{len(self._recal_alert_in_window)} "
+                  f"window frames")
+            return
+
+        pct = self._target_fp_rate * 100.0
+        scores_arr = np.fromiter(self._recal_scores, dtype=np.float64)
+        proposed = float(np.percentile(scores_arr, pct))
+
+        # Clamp per-attempt shift. Use a small floor when the current
+        # threshold is near zero — otherwise the clamp collapses and the
+        # threshold cannot move off zero in any single attempt.
+        base = max(abs(self.threshold), 0.01)
+        max_delta = base * (self._recal_max_delta_pct / 100.0)
+        delta = proposed - self.threshold
+        if abs(delta) > max_delta:
+            clamped = self.threshold + max_delta * (1.0 if delta > 0 else -1.0)
+            print(f"[iforest][recal] attempt {self._recal_attempt_count}: "
+                  f"Δ={delta:+.5f} exceeds clamp ±{max_delta:.5f}; "
+                  f"applying clamped Δ={clamped - self.threshold:+.5f}")
+            proposed = clamped
+
+        old = self.threshold
+        self.threshold = proposed
+        persisted = self._persist_recalibration()
+        print(f"[iforest][recal] attempt {self._recal_attempt_count}: "
+              f"threshold {old:+.5f} → {self.threshold:+.5f} "
+              f"(window={len(self._recal_scores)} frames, "
+              f"target FP={pct:.2f}%, persisted={persisted})")
+
+    def _persist_recalibration(self) -> bool:
+        """Atomically write the updated threshold back to the calibration JSON.
+
+        Reads-modifies-writes with a tmp + os.replace so a partial write
+        cannot leave the JSON malformed. Records when and which scenario
+        was recalibrated for offline auditing.
+        """
+        if not self.calibration_path:
+            return False
+        try:
+            if os.path.exists(self.calibration_path):
+                with open(self.calibration_path) as f:
+                    cal = json.load(f)
+            else:
+                cal = {}
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[iforest][recal] WARNING: could not read calibration "
+                  f"{self.calibration_path}: {e}")
+            return False
+        cal.setdefault("thresholds", {})[self.scenario] = float(self.threshold)
+        cal["last_recalibration_utc"] = datetime.now(tz=timezone.utc).isoformat()
+        cal["last_recalibration_scenario"] = self.scenario
+        cal["last_recalibration_window_frames"] = len(self._recal_scores)
+        tmp_path = self.calibration_path + ".tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(cal, f, indent=2)
+            os.replace(tmp_path, self.calibration_path)
+        except OSError as e:
+            print(f"[iforest][recal] WARNING: could not write calibration "
+                  f"{self.calibration_path}: {e}")
+            return False
+        return True
 
     def _flush_side_file(self) -> None:
         """Append buffered side-file rows; first flush emits the header."""
