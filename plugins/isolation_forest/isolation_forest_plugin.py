@@ -48,7 +48,7 @@ import csv
 import json
 import os
 import pickle
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -158,6 +158,33 @@ class Plugin(AIPlugin):
         # current threshold's magnitude. Prevents one bad recalibration
         # from blowing up the threshold; multiple attempts converge.
         "RecalibrationMaxDeltaPct": "50",
+        # Runtime scenario routing. When enabled, every frame reads
+        # RoutingSourceHeader (e.g. ADCS_GNC.Mode) and looks up which
+        # per-scenario IF to score with via RoutingModeMap. Hysteresis
+        # avoids thrashing across mode boundaries. OFF by default —
+        # legacy static-Scenario behavior preserved byte-for-byte.
+        "RuntimeRouting": "false",
+        # When dry-run, the plugin logs the histogram of observed
+        # RoutingSourceHeader values but does NOT switch models. Use it
+        # to build RoutingModeMap from real telemetry before flipping the
+        # apply path on; map values that aren't in the pickle's models
+        # would otherwise silently route to the static Scenario fallback.
+        "RoutingDryRun": "true",
+        "RoutingSourceHeader": "ADCS_GNC.Mode",
+        # JSON-encoded {mode_value_as_string: scenario_name}. Empty map
+        # means "every value falls through to the static Scenario." The
+        # actual mapping is mission-specific (ADCS mode enum semantics);
+        # the dry-run pass produces the data needed to populate it.
+        "RoutingModeMap": "{}",
+        # Consecutive frames a new mode must persist before the model
+        # switch fires. 30 frames ≈ 6 s at 5 Hz — matches the mode-
+        # transition residency expected on a real mode change and
+        # suppresses one-frame mode-bit jitter.
+        "RoutingHysteresisFrames": "30",
+        # In dry-run, emit the running histogram of observed mode values
+        # every N frames so the operator sees what's happening without
+        # tailing a per-frame log.
+        "RoutingDryRunReportEvery": "1000",
     }
 
     def __init__(self, name, headers):
@@ -170,6 +197,12 @@ class Plugin(AIPlugin):
             cal_path = self.model_path.removesuffix(".pkl") + ".calibration.json"
         self.calibration_path = cal_path
         self.scenario = cfg.get("scenario", self.DEFAULTS["Scenario"])
+        # Immutable reference to the ini-configured scenario. Used by the
+        # routing layer as the fail-safe target when an observed mode value
+        # has no entry in RoutingModeMap — graceful degradation back to a
+        # known, calibrated baseline rather than silently sticking on
+        # whatever the last switched scenario happened to be.
+        self._static_scenario = self.scenario
         fallback_threshold = float(cfg.get("anomalythreshold", self.DEFAULTS["AnomalyThreshold"]))
 
         with open(self.model_path, "rb") as f:
@@ -179,18 +212,23 @@ class Plugin(AIPlugin):
         self.include_deltas = artifact.get("config", {}).get("include_deltas", True)
 
         # Per-scenario layout takes precedence; legacy single-model is fallback.
+        # `self._models` holds every available scenario IF — runtime routing
+        # needs to switch between them at frame granularity.
         if "models" in artifact:
-            models = artifact["models"]
-            if self.scenario not in models:
+            self._models: dict[str, Any] = dict(artifact["models"])
+            if self.scenario not in self._models:
                 raise ValueError(
                     f"Scenario {self.scenario!r} not in pickle; "
-                    f"available: {sorted(models)}"
+                    f"available: {sorted(self._models)}"
                 )
-            self.model = models[self.scenario]
+            self.model = self._models[self.scenario]
             print(f"[iforest] per-scenario layout, routing through {self.scenario!r} IF "
-                  f"({len(models)} models in pickle)")
+                  f"({len(self._models)} models in pickle)")
         elif "model" in artifact:
+            # Synthesize a single-entry models dict so the rest of the
+            # plugin treats both layouts uniformly.
             self.model = artifact["model"]
+            self._models = {self.scenario: self.model}
             print(f"[iforest] single-model layout, scenario={self.scenario!r} (advisory)")
         else:
             raise ValueError(f"{self.model_path}: no 'models' or 'model' key in pickle")
@@ -251,8 +289,56 @@ class Plugin(AIPlugin):
             "recalibrationmaxdeltapct", self.DEFAULTS["RecalibrationMaxDeltaPct"]))
         self._recal_scores: deque[float] = deque(maxlen=self._recal_window)
         self._recal_alert_in_window: deque[bool] = deque(maxlen=self._recal_window)
+        # Parallel deque tagging each window frame with the active scenario.
+        # A window that spans multiple scenarios (e.g., a mode switch fell
+        # inside it) is treated as contaminated — the percentile would mix
+        # distributions and the resulting threshold would be wrong for both.
+        self._recal_scenarios: deque[str] = deque(maxlen=self._recal_window)
         self._recal_frames_since = 0
         self._recal_attempt_count = 0
+
+        # Runtime scenario routing state.
+        self._routing_enabled = cfg.get(
+            "runtimerouting", self.DEFAULTS["RuntimeRouting"]
+        ).strip().lower() == "true"
+        self._routing_dry_run = cfg.get(
+            "routingdryrun", self.DEFAULTS["RoutingDryRun"]
+        ).strip().lower() == "true"
+        self._routing_source = cfg.get(
+            "routingsourceheader", self.DEFAULTS["RoutingSourceHeader"]
+        ).strip()
+        try:
+            raw_map = cfg.get("routingmodemap", self.DEFAULTS["RoutingModeMap"])
+            self._routing_map: dict[str, str] = {
+                str(k): str(v) for k, v in json.loads(raw_map).items()
+            }
+        except (json.JSONDecodeError, AttributeError) as e:
+            print(f"[iforest][route] WARNING: RoutingModeMap parse failed ({e!r}); "
+                  f"treating as empty map")
+            self._routing_map = {}
+        self._routing_hyst = max(1, int(cfg.get(
+            "routinghysteresisframes", self.DEFAULTS["RoutingHysteresisFrames"])))
+        self._routing_report_every = max(1, int(cfg.get(
+            "routingdryrunreportevery", self.DEFAULTS["RoutingDryRunReportEvery"])))
+        self._routing_source_idx: int | None = (
+            self._header_to_idx.get(self._routing_source) if self._routing_enabled else None
+        )
+        # Bad config is loud at startup: map values must name actual scenarios.
+        if self._routing_enabled:
+            unknown = [v for v in self._routing_map.values() if v not in self._models]
+            if unknown:
+                raise ValueError(
+                    f"RoutingModeMap targets scenarios not in pickle: {sorted(set(unknown))}; "
+                    f"available: {sorted(self._models)}"
+                )
+            if self._routing_source_idx is None:
+                print(f"[iforest][route] WARNING: RoutingSourceHeader "
+                      f"{self._routing_source!r} not found in headers; "
+                      f"routing inactive for this session")
+        self._routing_observed: Counter[str] = Counter()
+        self._routing_pending_scenario: str | None = None
+        self._routing_pending_streak = 0
+        self._routing_switches = 0
 
         # Side-file writer setup.
         self._side_file_path: str | None = None
@@ -285,6 +371,12 @@ class Plugin(AIPlugin):
             print(f"[iforest] recalibration ENABLED: window={self._recal_window} "
                   f"frames, interval={self._recal_interval} frames, "
                   f"clamp=±{self._recal_max_delta_pct:.0f}%, target FP={tfp}")
+        if self._routing_enabled:
+            mode = "DRY-RUN" if self._routing_dry_run else "APPLY"
+            map_str = (f"{len(self._routing_map)} entries"
+                       if self._routing_map else "EMPTY")
+            print(f"[iforest] routing ENABLED ({mode}): source={self._routing_source}, "
+                  f"map={map_str}, hysteresis={self._routing_hyst} frames")
         if self._side_file_path is not None:
             print(f"[iforest] side-file → {self._side_file_path} "
                   f"(flush every {self._side_file_flush_every} rows)")
@@ -350,9 +442,97 @@ class Plugin(AIPlugin):
 
         return raw
 
+    def _read_threshold_from_json(self, scenario: str, fallback: float) -> float:
+        """Quiet variant of `_load_threshold` for runtime scenario switches.
+
+        No init-style logging — just returns the calibrated threshold for
+        the named scenario, falling back when the file or entry is missing.
+        Used by `_switch_scenario` so a routing-driven model swap picks up
+        any recalibration-driven threshold updates without flooding stdout.
+        """
+        if not os.path.exists(self.calibration_path):
+            return fallback
+        try:
+            with open(self.calibration_path) as f:
+                cal = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return fallback
+        thr = (cal.get("thresholds") or {}).get(scenario)
+        return float(thr) if thr is not None else fallback
+
+    def _handle_routing(self, frame) -> None:
+        """Observe the routing source value and (unless dry-run) drive the
+        per-scenario model switch via N-frame hysteresis.
+
+        Dry-run mode skips the switch path entirely and just accumulates
+        a histogram of observed mode values, periodically logged so the
+        operator can build the RoutingModeMap from real telemetry before
+        flipping the apply path on.
+        """
+        if self._routing_source_idx is None:
+            return
+        raw_value = frame[self._routing_source_idx]
+        # ADCS mode is an int but the frame entry arrives as a string from
+        # the SBN adapter; normalize to string so the map lookup is robust.
+        key = str(raw_value).strip()
+        self._routing_observed[key] += 1
+
+        if self._routing_dry_run:
+            if (self._routing_report_every > 0
+                    and self._frame_count > 0
+                    and self._frame_count % self._routing_report_every == 0):
+                self._log_dry_run_histogram()
+            return
+
+        target = self._routing_map.get(key, self._static_scenario)
+        if target == self.scenario:
+            self._routing_pending_scenario = None
+            self._routing_pending_streak = 0
+            return
+        if self._routing_pending_scenario != target:
+            self._routing_pending_scenario = target
+            self._routing_pending_streak = 1
+        else:
+            self._routing_pending_streak += 1
+        if self._routing_pending_streak >= self._routing_hyst:
+            self._switch_scenario(target)
+            self._routing_pending_scenario = None
+            self._routing_pending_streak = 0
+
+    def _log_dry_run_histogram(self) -> None:
+        n = sum(self._routing_observed.values())
+        in_map = sum(c for k, c in self._routing_observed.items()
+                     if k in self._routing_map)
+        top = ", ".join(f"{k}:{c}"
+                        for k, c in self._routing_observed.most_common(8))
+        coverage = f"{in_map}/{n}" if self._routing_map else "no map yet"
+        print(f"[iforest][route][dry-run] frame={self._frame_count} "
+              f"observed N={n} (in-map: {coverage}) top: {top}")
+
+    def _switch_scenario(self, new_scenario: str) -> None:
+        if new_scenario == self.scenario:
+            return
+        if new_scenario not in self._models:
+            print(f"[iforest][route] WARNING: target scenario "
+                  f"{new_scenario!r} not in pickle; staying on "
+                  f"{self.scenario!r}")
+            return
+        old_scn = self.scenario
+        old_thr = self.threshold
+        self.scenario = new_scenario
+        self.model = self._models[new_scenario]
+        self.threshold = self._read_threshold_from_json(
+            new_scenario, fallback=self.threshold)
+        self._routing_switches += 1
+        print(f"[iforest][route] scenario {old_scn} → {new_scenario} "
+              f"at frame={self._frame_count + 1}; "
+              f"threshold {old_thr:+.5f} → {self.threshold:+.5f}")
+
     def update(self, low_level_data=None, high_level_data=None):
         if not low_level_data:
             return
+        if self._routing_enabled:
+            self._handle_routing(low_level_data)
         raw = self._frame_to_raw(low_level_data)
 
         if self.include_deltas:
@@ -435,6 +615,7 @@ class Plugin(AIPlugin):
         if self._recal_enabled:
             self._recal_scores.append(score)
             self._recal_alert_in_window.append(self._alert_active)
+            self._recal_scenarios.append(self.scenario)
             self._recal_frames_since += 1
             if (self._recal_frames_since >= self._recal_interval
                     and len(self._recal_scores) >= self._recal_window):
@@ -461,6 +642,15 @@ class Plugin(AIPlugin):
             print(f"[iforest][recal] attempt {self._recal_attempt_count} skipped: "
                   f"alert_active was True on {n_alerted}/{len(self._recal_alert_in_window)} "
                   f"window frames")
+            return
+        unique_scenarios = set(self._recal_scenarios)
+        if len(unique_scenarios) > 1:
+            # Window spans a scenario switch — mixing distributions would
+            # give a percentile that's wrong for both scenarios. Wait for a
+            # window that lives entirely under one scenario.
+            print(f"[iforest][recal] attempt {self._recal_attempt_count} skipped: "
+                  f"window spans {len(unique_scenarios)} scenarios "
+                  f"({sorted(unique_scenarios)})")
             return
 
         pct = self._target_fp_rate * 100.0

@@ -31,11 +31,23 @@ class _FakeIF:
         return np.full(len(X), self.score, dtype=float)
 
 
-def _make_artifact(score: float, scenario: str = "nominal_ops"):
+def _make_artifact(score: float, scenario: str = "nominal_ops",
+                   extra_scenarios: dict | None = None,
+                   scalar_columns=None):
+    """Build a pickle-shaped artifact.
+
+    `extra_scenarios` lets a test stand up multiple per-scenario IFs in the
+    same pickle (each entry: scenario_name → fake-IF score) so routing
+    tests can assert which model scored a given frame.
+    """
+    models = {scenario: _FakeIF(score=score)}
+    if extra_scenarios:
+        for name, s in extra_scenarios.items():
+            models[name] = _FakeIF(score=s)
     return {
-        "models": {scenario: _FakeIF(score=score)},
+        "models": models,
         "schema": {
-            "scalar_columns": ["foo", "bar"],
+            "scalar_columns": scalar_columns or ["foo", "bar"],
             "list_columns": {},
         },
         "config": {"include_deltas": False},
@@ -59,19 +71,34 @@ def configured(tmp_path, monkeypatch):
                recal_window: int = 9000,
                recal_interval: int = 1500,
                recal_max_delta_pct: float = 50.0,
-               target_fp_rate: float | None = None):
+               target_fp_rate: float | None = None,
+               extra_scenarios: dict | None = None,
+               extra_thresholds: dict | None = None,
+               headers: list | None = None,
+               routing_enabled: str = "false",
+               routing_dry_run: str = "true",
+               routing_source: str = "ADCS_GNC.Mode",
+               routing_map: dict | None = None,
+               routing_hysteresis: int = 30,
+               routing_report_every: int = 1000):
         pkl = tmp_path / "m.pkl"
         with open(pkl, "wb") as f:
-            pickle.dump(_make_artifact(score=score), f)
+            pickle.dump(_make_artifact(
+                score=score, extra_scenarios=extra_scenarios,
+                scalar_columns=headers,
+            ), f)
         cal = tmp_path / "m.calibration.json"
         cal_obj: dict = {"thresholds": {"nominal_ops": threshold}}
+        if extra_thresholds:
+            cal_obj["thresholds"].update(extra_thresholds)
         if target_fp_rate is not None:
             cal_obj["target_fp_rate"] = target_fp_rate
         cal.write_text(json.dumps(cal_obj))
         ini = tmp_path / "test.ini"
         # Default the gating *off* so existing tests of edge-bit / flush
         # behavior aren't accidentally suppressed; warmup + hysteresis +
-        # recalibration get exercised by dedicated tests below.
+        # recalibration + routing get exercised by dedicated tests below.
+        routing_map_json = json.dumps(routing_map or {})
         ini.write_text(
             "[ISOLATION_FOREST]\n"
             f"ModelPath = {pkl}\n"
@@ -88,9 +115,15 @@ def configured(tmp_path, monkeypatch):
             f"RecalibrationWindowFrames = {recal_window}\n"
             f"RecalibrationIntervalFrames = {recal_interval}\n"
             f"RecalibrationMaxDeltaPct = {recal_max_delta_pct}\n"
+            f"RuntimeRouting = {routing_enabled}\n"
+            f"RoutingDryRun = {routing_dry_run}\n"
+            f"RoutingSourceHeader = {routing_source}\n"
+            f"RoutingModeMap = {routing_map_json}\n"
+            f"RoutingHysteresisFrames = {routing_hysteresis}\n"
+            f"RoutingDryRunReportEvery = {routing_report_every}\n"
         )
         monkeypatch.setenv("ONAIR_INI_FILE", str(ini))
-        return IF_Plugin(MagicMock(), ["foo", "bar"])
+        return IF_Plugin(MagicMock(), headers or ["foo", "bar"])
 
     return _build
 
@@ -386,3 +419,153 @@ def test_warmup_does_not_leak_streak_into_post_warmup_hysteresis(configured, tmp
     # ALERT fires on f4 (second post-warmup anomaly), NOT f3.
     assert alerts == ["0", "0", "0", "1"]
     assert plugin._alert_active is True
+
+
+# ── Runtime scenario routing (follow-up #3) ───────────────────────────────
+
+ROUTING_HEADERS = ["foo", "bar", "ADCS_GNC.Mode"]
+
+
+def test_routing_disabled_by_default_keeps_static_scenario(configured, tmp_path):
+    """Default OFF must be byte-identical to pre-#3: every frame stays on
+    the static `Scenario`, no [route] log noise, no observed counter."""
+    plugin = configured(score=0.1, threshold=0.0,
+                        headers=ROUTING_HEADERS,
+                        routing_enabled="false")
+    for mode in ("1", "2", "3", "4"):
+        plugin.update(low_level_data=["1.0", "2.0", mode])
+    assert plugin.scenario == "nominal_ops"
+    assert plugin._routing_switches == 0
+    assert len(plugin._routing_observed) == 0
+
+
+def test_routing_dry_run_collects_histogram_without_switching(configured, tmp_path):
+    """Dry-run is the safe path for building RoutingModeMap from real
+    telemetry — it must record every observed value but never touch
+    `self.scenario` or `self.model`, even when the map is populated."""
+    plugin = configured(score=0.1, threshold=0.0,
+                        headers=ROUTING_HEADERS,
+                        extra_scenarios={"maneuvers": 0.2, "comm_passes": 0.3},
+                        extra_thresholds={"maneuvers": 0.05, "comm_passes": 0.04},
+                        routing_enabled="true",
+                        routing_dry_run="true",
+                        routing_map={"3": "maneuvers", "4": "comm_passes"},
+                        routing_hysteresis=2,
+                        routing_report_every=0)  # disable periodic log
+    sequence = ["1", "1", "3", "3", "3", "4", "4", "4", "4"]
+    for mode in sequence:
+        plugin.update(low_level_data=["1.0", "2.0", mode])
+
+    # Histogram captures every observation.
+    assert plugin._routing_observed == {"1": 2, "3": 3, "4": 4}
+    # But no model switch despite the map suggesting one.
+    assert plugin.scenario == "nominal_ops"
+    assert plugin._routing_switches == 0
+
+
+def test_routing_apply_switches_after_hysteresis_and_loads_threshold(
+        configured, tmp_path):
+    """With dry-run off and a populated map, N consec frames in a new mode
+    fire a single [route] switch — model + threshold both swap, and the
+    side-file's scenario column reflects which IF scored each frame."""
+    plugin = configured(score=0.1, threshold=0.0,
+                        flush_every=1,
+                        headers=ROUTING_HEADERS,
+                        extra_scenarios={"maneuvers": -0.5},
+                        extra_thresholds={"maneuvers": -0.30},
+                        routing_enabled="true",
+                        routing_dry_run="false",
+                        routing_map={"3": "maneuvers"},
+                        routing_hysteresis=2,
+                        routing_report_every=0)
+    # Frame 1: mode=1, no map entry → no switch, scored by nominal IF (0.1).
+    plugin.update(low_level_data=["1.0", "2.0", "1"])
+    # Frame 2-3: mode=3 (target=maneuvers), build hysteresis streak.
+    plugin.update(low_level_data=["1.0", "2.0", "3"])  # streak=1, no switch
+    assert plugin.scenario == "nominal_ops"
+    plugin.update(low_level_data=["1.0", "2.0", "3"])  # streak=2 → SWITCH
+
+    assert plugin.scenario == "maneuvers"
+    assert plugin._routing_switches == 1
+    # Model + threshold both updated from the new scenario's pickle entry
+    # and JSON entry respectively.
+    assert plugin.threshold == pytest.approx(-0.30)
+    # Frame 3's score came from the new (maneuvers) IF, value -0.5.
+    _, rows = _read_side_file(tmp_path)
+    last = rows[-1]
+    assert last[1] == "maneuvers"
+    assert float(last[2]) == pytest.approx(-0.5)
+
+
+def test_routing_unmapped_mode_falls_back_to_static_scenario(
+        configured, tmp_path):
+    """Values not in the map must NOT silently route through anything other
+    than the static `Scenario` — and must NOT cause a switch back to
+    `Scenario` once we're on a different scenario."""
+    plugin = configured(score=0.1, threshold=0.0,
+                        headers=ROUTING_HEADERS,
+                        extra_scenarios={"maneuvers": 0.2},
+                        extra_thresholds={"maneuvers": 0.05},
+                        routing_enabled="true",
+                        routing_dry_run="false",
+                        routing_map={"3": "maneuvers"},
+                        routing_hysteresis=1,
+                        routing_report_every=0)
+    # Switch to maneuvers.
+    plugin.update(low_level_data=["1.0", "2.0", "3"])
+    assert plugin.scenario == "maneuvers"
+    # Now an unmapped mode value arrives. Target = fallback = current
+    # scenario (static `Scenario` = nominal_ops, so target IS different
+    # from current "maneuvers" → would attempt to switch back).
+    # The expected behavior is: unmapped values fall back to STATIC scenario
+    # and route back to it via the same hysteresis path.
+    plugin.update(low_level_data=["1.0", "2.0", "99"])
+    # Single frame of fallback isn't enough; hysteresis=1 → flip back.
+    assert plugin.scenario == "nominal_ops"
+    assert plugin._routing_switches == 2
+
+
+def test_routing_init_rejects_map_targeting_missing_scenario(configured, tmp_path):
+    """Bad config must be loud: a map entry pointing at a scenario that's
+    not in the pickle is a deployment error, not a soft fallback."""
+    with pytest.raises(ValueError, match="RoutingModeMap targets scenarios not in pickle"):
+        configured(score=0.1, threshold=0.0,
+                   headers=ROUTING_HEADERS,
+                   routing_enabled="true",
+                   routing_dry_run="false",
+                   routing_map={"3": "no_such_scenario"})
+
+
+def test_routing_recalibration_skips_cross_scenario_window(
+        configured, tmp_path):
+    """A recalibration window that spans a scenario switch must be skipped
+    — the percentile of a mixed-distribution sample would be wrong for
+    both scenarios. This is the routing-aware extension of the existing
+    alert-active gate."""
+    plugin = configured(score=0.1, threshold=0.10, flush_every=1,
+                        warmup_frames=0, alert_hysteresis=1, clear_hysteresis=1,
+                        headers=ROUTING_HEADERS,
+                        extra_scenarios={"maneuvers": 0.2},
+                        extra_thresholds={"maneuvers": 0.05},
+                        recal_enabled="true", target_fp_rate=0.5,
+                        recal_window=4, recal_interval=4,
+                        recal_max_delta_pct=10000.0,
+                        routing_enabled="true",
+                        routing_dry_run="false",
+                        routing_map={"3": "maneuvers"},
+                        routing_hysteresis=1,
+                        routing_report_every=0)
+    # Two frames under nominal_ops, then switch to maneuvers (hysteresis=1).
+    plugin.update(low_level_data=["1.0", "2.0", "1"])
+    plugin.update(low_level_data=["1.0", "2.0", "1"])
+    plugin.update(low_level_data=["1.0", "2.0", "3"])  # switch on this frame
+    plugin.update(low_level_data=["1.0", "2.0", "3"])  # window full → attempt
+
+    assert plugin._routing_switches == 1
+    assert plugin._recal_attempt_count == 1
+    # Threshold unchanged because the window had 2 distinct scenarios.
+    # After switch, threshold reflects maneuvers' calibrated value.
+    assert plugin.threshold == pytest.approx(0.05)
+    with open(plugin.calibration_path) as f:
+        cal = json.load(f)
+    assert "last_recalibration_utc" not in cal
