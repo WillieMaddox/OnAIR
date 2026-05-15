@@ -156,13 +156,26 @@ class DataSource(OnAirDataSource):
 
     def message_listener_thread(self):
         """Thread to listen for incoming messages from SBN"""
+        # Track unknown MIDs we've already warned about so the log isn't spammed
+        # under a fuzz attack (EX-0009.01-style) that delivers many unknown StreamIds.
+        unknown_mids_seen = set()
 
         while(True):
             generic_recv_msg_p = POINTER(sbn.sbn_data_generic_t)()
             sbn.recv_msg(generic_recv_msg_p)
 
             msgID = generic_recv_msg_p.contents.TlmHeader.Primary.StreamId
-            app_name, data_struct = self.msgID_lookup_table[msgID]
+            try:
+                app_name, data_struct = self.msgID_lookup_table[msgID]
+            except KeyError:
+                # Unknown / malformed StreamId — common under fuzz attacks or
+                # FSW init handshake. Skip the packet rather than letting the
+                # KeyError propagate and kill the listener thread (which would
+                # back up SBN with "pipe overflow" floods and break detection).
+                if msgID not in unknown_mids_seen:
+                    print(f"[sbn_adapter] WARNING: unknown StreamId 0x{msgID:04X}; skipping (logged once per MID)")
+                    unknown_mids_seen.add(msgID)
+                continue
 
             recv_msg_p = POINTER(data_struct)()
             recv_msg_p.contents = generic_recv_msg_p.contents
