@@ -80,7 +80,8 @@ def configured(tmp_path, monkeypatch):
                routing_source: str = "ADCS_GNC.Mode",
                routing_map: dict | None = None,
                routing_hysteresis: int = 30,
-               routing_report_every: int = 1000):
+               routing_report_every: int = 1000,
+               mode_switch_warmup_frames: int = 0):
         pkl = tmp_path / "m.pkl"
         with open(pkl, "wb") as f:
             pickle.dump(_make_artifact(
@@ -121,6 +122,7 @@ def configured(tmp_path, monkeypatch):
             f"RoutingModeMap = {routing_map_json}\n"
             f"RoutingHysteresisFrames = {routing_hysteresis}\n"
             f"RoutingDryRunReportEvery = {routing_report_every}\n"
+            f"ModeSwitchWarmupFrames = {mode_switch_warmup_frames}\n"
         )
         monkeypatch.setenv("ONAIR_INI_FILE", str(ini))
         return IF_Plugin(MagicMock(), headers or ["foo", "bar"])
@@ -569,3 +571,221 @@ def test_routing_recalibration_skips_cross_scenario_window(
     with open(plugin.calibration_path) as f:
         cal = json.load(f)
     assert "last_recalibration_utc" not in cal
+
+
+# ── Mode-switch warmup (mode-entry transient suppression) ────────────────
+
+
+def test_mode_switch_resets_prev_raw_and_hysteresis_counters(
+        configured, tmp_path):
+    """Every routing-driven switch must clear prev_raw (first new-mode
+    frame should see zero deltas, matching cold-start + training file-
+    boundary semantics) and the consec_anomaly / consec_nominal streaks
+    (a streak from the old mode must not bias the post-switch threshold
+    crossing in the new mode). The mode-switch warmup counter is set to
+    N-1 right after the switch frame itself consumes the first count."""
+    plugin = configured(score=0.1, threshold=0.0,
+                        flush_every=1,
+                        headers=ROUTING_HEADERS,
+                        extra_scenarios={"maneuvers": -0.5},
+                        extra_thresholds={"maneuvers": -0.30},
+                        routing_enabled="true",
+                        routing_dry_run="false",
+                        routing_map={"3": "maneuvers"},
+                        routing_hysteresis=1,
+                        routing_report_every=0,
+                        mode_switch_warmup_frames=5)
+
+    # Pre-load streaks + prev_raw so the assertion that they reset is real.
+    plugin._consec_anomaly = 7
+    plugin._consec_nominal = 3
+    # First frame mode=3 with hysteresis=1 → switch fires inside this call.
+    plugin.update(low_level_data=["1.0", "2.0", "3"])
+
+    assert plugin.scenario == "maneuvers"
+    assert plugin._routing_switches == 1
+    # Switch reset the deltas + streaks. (prev_raw gets repopulated at the
+    # end of this update; the behavior we care about is that the DELTA path
+    # used None when computing this frame's features — covered by the
+    # zero-delta semantic. Streak counters are observable after update().)
+    assert plugin._consec_anomaly == 0
+    assert plugin._consec_nominal == 0
+    # Mode-switch warmup re-armed; the switch frame consumed one count.
+    assert plugin._mode_switch_warmup_remaining == 4
+
+
+def test_mode_switch_warmup_suppresses_alerts_during_window(
+        configured, tmp_path):
+    """An anomalous score in the post-switch model must NOT fire ALERT
+    while the mode-switch warmup window is open. Once the window expires,
+    accumulated anomaly streaks resume from zero and ALERT fires on the
+    next AlertHysteresis-th consecutive anomaly frame."""
+    plugin = configured(score=0.1, threshold=0.0,
+                        flush_every=1,
+                        warmup_frames=0,
+                        alert_hysteresis=1,
+                        clear_hysteresis=1,
+                        headers=ROUTING_HEADERS,
+                        # Post-switch IF returns -0.5 against threshold -0.3
+                        # → every post-switch frame is_anomaly=True.
+                        extra_scenarios={"maneuvers": -0.5},
+                        extra_thresholds={"maneuvers": -0.30},
+                        routing_enabled="true",
+                        routing_dry_run="false",
+                        routing_map={"3": "maneuvers"},
+                        routing_hysteresis=1,
+                        routing_report_every=0,
+                        mode_switch_warmup_frames=3)
+
+    # Frame 1: switch fires (consumes 1 of 3 warmup counts) → in_warmup.
+    plugin.update(low_level_data=["1.0", "2.0", "3"])
+    # Frames 2-3: still in mode-switch warmup.
+    plugin.update(low_level_data=["1.0", "2.0", "3"])
+    plugin.update(low_level_data=["1.0", "2.0", "3"])
+    # Frame 4: warmup window closed; AlertHysteresis=1 → ALERT fires.
+    plugin.update(low_level_data=["1.0", "2.0", "3"])
+
+    _, rows = _read_side_file(tmp_path)
+    data = rows[1:]
+    is_anom = [r[4] for r in data]
+    alerts = [r[5] for r in data]
+    # Raw is_anomaly recorded faithfully on every post-switch frame
+    # (decision_function < threshold ⇒ -0.5 < -0.3 ⇒ True).
+    assert is_anom == ["1", "1", "1", "1"]
+    # ALERT suppressed for the 3 warmup frames; fires on frame 4.
+    assert alerts == ["0", "0", "0", "1"]
+    assert plugin._alert_active is True
+    assert plugin._mode_switch_warmup_remaining == 0
+
+
+def test_mode_switch_warmup_zero_does_not_rearm(configured, tmp_path):
+    """Default `ModeSwitchWarmupFrames=0` must preserve pre-feature
+    behavior: a switch followed by an immediate anomaly fires ALERT on
+    the very next post-switch frame (AlertHysteresis=1). Backward-compat
+    against routing-only deployments that don't want the new suppression."""
+    plugin = configured(score=0.1, threshold=0.0,
+                        flush_every=1,
+                        warmup_frames=0,
+                        alert_hysteresis=1,
+                        clear_hysteresis=1,
+                        headers=ROUTING_HEADERS,
+                        extra_scenarios={"maneuvers": -0.5},
+                        extra_thresholds={"maneuvers": -0.30},
+                        routing_enabled="true",
+                        routing_dry_run="false",
+                        routing_map={"3": "maneuvers"},
+                        routing_hysteresis=1,
+                        routing_report_every=0,
+                        mode_switch_warmup_frames=0)
+
+    plugin.update(low_level_data=["1.0", "2.0", "3"])  # switch + score -0.5
+
+    _, rows = _read_side_file(tmp_path)
+    data = rows[1:]
+    assert plugin.scenario == "maneuvers"
+    assert plugin._routing_switches == 1
+    # No warmup re-arm: this frame is fully operational.
+    assert plugin._mode_switch_warmup_remaining == 0
+    # The single post-switch anomaly frame fires ALERT immediately.
+    assert data[0][4] == "1"   # is_anomaly
+    assert data[0][5] == "1"   # alert
+    assert plugin._alert_active is True
+
+
+def test_mode_switch_warmup_does_not_leak_streak_into_post_warmup(
+        configured, tmp_path):
+    """Once the mode-switch warmup window closes, the hysteresis counter
+    starts fresh (same invariant the cold-start warmup already enforces).
+    A 4-frame anomaly burst spanning warmup must NOT auto-fire ALERT on
+    the first post-warmup frame — it must require AlertHysteresis fresh
+    anomaly frames after warmup."""
+    plugin = configured(score=0.1, threshold=0.0,
+                        flush_every=1,
+                        warmup_frames=0,
+                        alert_hysteresis=2,
+                        clear_hysteresis=2,
+                        headers=ROUTING_HEADERS,
+                        extra_scenarios={"maneuvers": -0.5},
+                        extra_thresholds={"maneuvers": -0.30},
+                        routing_enabled="true",
+                        routing_dry_run="false",
+                        routing_map={"3": "maneuvers"},
+                        routing_hysteresis=1,
+                        routing_report_every=0,
+                        mode_switch_warmup_frames=2)
+
+    # f1: switch + 1 of 2 warmup counts.
+    plugin.update(low_level_data=["1.0", "2.0", "3"])
+    # f2: last warmup count.
+    plugin.update(low_level_data=["1.0", "2.0", "3"])
+    # f3: post-warmup, anom → consec=1, no ALERT.
+    plugin.update(low_level_data=["1.0", "2.0", "3"])
+    # f4: post-warmup, anom → consec=2 → ALERT.
+    plugin.update(low_level_data=["1.0", "2.0", "3"])
+
+    _, rows = _read_side_file(tmp_path)
+    is_anom = [r[4] for r in rows[1:]]
+    alerts = [r[5] for r in rows[1:]]
+    assert is_anom == ["1", "1", "1", "1"]
+    assert alerts == ["0", "0", "0", "1"]
+    assert plugin._alert_active is True
+
+
+def test_delta_only_mask_built_from_schema(tmp_path, monkeypatch):
+    """When the saved schema lists delta_only_columns, the plugin builds a
+    raw-keep mask that excludes those positions from the raw half but keeps
+    every position in the delta half. The asserted invariant is what
+    features.build_features produces at train time: feature_dim =
+    n_raw_kept + n_raw."""
+    pkl = tmp_path / "m.pkl"
+    artifact = {
+        "models": {"nominal_ops": _FakeIF(score=0.05)},
+        "schema": {
+            # Two scalars + one 3-leaf list column, where one scalar and the
+            # list column are delta-only. Raw layout (length 5):
+            #   [SecondsMET, OtherScalar, bvb[0], bvb[1], bvb[2]]
+            # Suppressed:   [    ✓     ,            ✓     ✓     ✓ ]
+            "scalar_columns": ["CFE_TIME.SecondsMET", "CFE_EVS_HK.CommandCounter"],
+            "list_columns": {
+                "ADCS_DI.Payload.Mag.bvb": {
+                    "top_shape": [3],
+                    "paths": [[0], [1], [2]],
+                }
+            },
+            "delta_only_columns": [
+                "CFE_TIME.SecondsMET",
+                "ADCS_DI.Payload.Mag.bvb",
+            ],
+        },
+        "config": {"include_deltas": True},
+    }
+    with open(pkl, "wb") as f:
+        pickle.dump(artifact, f)
+    cal = tmp_path / "m.calibration.json"
+    cal.write_text(json.dumps({"thresholds": {"nominal_ops": 0.0}}))
+    ini = tmp_path / "test.ini"
+    ini.write_text(
+        "[ISOLATION_FOREST]\n"
+        f"ModelPath = {pkl}\n"
+        f"CalibrationPath = {cal}\n"
+        "Scenario = nominal_ops\n"
+        "WriteSideFile = false\n"
+        f"SideFileOutputDir = {tmp_path}\n"
+    )
+    monkeypatch.setenv("ONAIR_INI_FILE", str(ini))
+    headers = ["CFE_TIME.SecondsMET", "CFE_EVS_HK.CommandCounter",
+               "ADCS_DI.Payload.Mag.bvb"]
+    plugin = IF_Plugin(MagicMock(), headers)
+
+    assert plugin.n_raw == 5
+    # Mask aligns with the layout: [scalar_delta_only, scalar_kept, leaf, leaf, leaf]
+    assert plugin._delta_only_raw_mask.tolist() == [True, False, True, True, True]
+    assert plugin._raw_keep_mask.tolist() == [False, True, False, False, False]
+
+    # Two consecutive frames so a real delta is computed (no zero-row).
+    plugin.update(low_level_data=["100", "10", "[1.0, 2.0, 3.0]"])
+    plugin.update(low_level_data=["200", "11", "[1.1, 2.2, 3.3]"])
+
+    # Score recorded → update() reached decision_function with a
+    # well-shaped feature vector (1 kept raw + 5 deltas = 6 dims).
+    assert plugin._latest_score == pytest.approx(0.05)

@@ -185,6 +185,17 @@ class Plugin(AIPlugin):
         # every N frames so the operator sees what's happening without
         # tailing a per-frame log.
         "RoutingDryRunReportEvery": "1000",
+        # Mode-switch warmup. After every routing-driven scenario switch
+        # the plugin re-arms an N-frame warmup window during which ALERT
+        # and CLEAR transitions are suppressed (raw is_anomaly still
+        # written to the side-file). 600 frames ≈ 2 min at 5 Hz —
+        # empirically covers the ~2-min FP transient observed on every
+        # ADCS mode change (see project_v5_mode_soak_protocol). The
+        # switch also clears prev_raw and the hysteresis counters so the
+        # first new-mode frame has zero deltas (matches cold-start +
+        # training file-boundary semantics) and stale anomaly/nominal
+        # streaks don't carry across the boundary.
+        "ModeSwitchWarmupFrames": "600",
     }
 
     def __init__(self, name, headers):
@@ -242,15 +253,40 @@ class Plugin(AIPlugin):
         # frozen at training time; column-type drift in scoring data can't
         # change feature count.
         self._header_to_idx = {h: i for i, h in enumerate(headers)}
-        self._scalar_indices = [self._header_to_idx[c] for c in self.schema["scalar_columns"]
-                                if c in self._header_to_idx]
+        delta_only_set: set[str] = set(self.schema.get("delta_only_columns") or [])
+        self._scalar_indices: list[int] = []
+        scalar_delta_only_flags: list[bool] = []
+        for c in self.schema["scalar_columns"]:
+            if c not in self._header_to_idx:
+                continue
+            self._scalar_indices.append(self._header_to_idx[c])
+            scalar_delta_only_flags.append(c in delta_only_set)
         self._list_columns: list[tuple[int, list[list[int]]]] = []
+        list_delta_only_flags: list[bool] = []
         for col, layout in self.schema["list_columns"].items():
             if col not in self._header_to_idx:
                 continue
             self._list_columns.append((self._header_to_idx[col], layout["paths"]))
+            list_delta_only_flags.append(col in delta_only_set)
 
         self.n_raw = len(self._scalar_indices) + sum(len(p) for _, p in self._list_columns)
+        # Mask over raw-vector indices marking columns whose raw values are
+        # suppressed from the feature matrix (but whose deltas survive).
+        # Must mirror the training-time logic in features.build_features.
+        if delta_only_set:
+            mask = np.zeros(self.n_raw, dtype=bool)
+            for i, is_do in enumerate(scalar_delta_only_flags):
+                mask[i] = is_do
+            offset = len(self._scalar_indices)
+            for (_, paths), is_do in zip(self._list_columns, list_delta_only_flags):
+                if is_do:
+                    mask[offset:offset + len(paths)] = True
+                offset += len(paths)
+            self._delta_only_raw_mask = mask
+            self._raw_keep_mask = ~mask
+        else:
+            self._delta_only_raw_mask = None
+            self._raw_keep_mask = None
         self.prev_raw: np.ndarray | None = None
         self._latest_score: float | None = None
         self._latest_is_anomaly: bool = False
@@ -339,6 +375,12 @@ class Plugin(AIPlugin):
         self._routing_pending_scenario: str | None = None
         self._routing_pending_streak = 0
         self._routing_switches = 0
+        # Mode-switch warmup: counter set by _switch_scenario(), counted
+        # down each frame in update(). While > 0 the frame is treated as
+        # warmup (alert/clear suppressed, hysteresis counters held at 0).
+        self._mode_switch_warmup_frames = max(0, int(cfg.get(
+            "modeswitchwarmupframes", self.DEFAULTS["ModeSwitchWarmupFrames"])))
+        self._mode_switch_warmup_remaining = 0
 
         # Side-file writer setup.
         self._side_file_path: str | None = None
@@ -377,6 +419,8 @@ class Plugin(AIPlugin):
                        if self._routing_map else "EMPTY")
             print(f"[iforest] routing ENABLED ({mode}): source={self._routing_source}, "
                   f"map={map_str}, hysteresis={self._routing_hyst} frames")
+            print(f"[iforest] mode-switch warmup={self._mode_switch_warmup_frames} "
+                  f"frames (re-armed on every scenario switch)")
         if self._side_file_path is not None:
             print(f"[iforest] side-file → {self._side_file_path} "
                   f"(flush every {self._side_file_flush_every} rows)")
@@ -524,9 +568,20 @@ class Plugin(AIPlugin):
         self.threshold = self._read_threshold_from_json(
             new_scenario, fallback=self.threshold)
         self._routing_switches += 1
+        # Re-arm mode-switch warmup + clear cross-mode delta and stale
+        # hysteresis streaks. prev_raw from the old mode would otherwise
+        # produce a huge cross-mode delta on the first new-mode frame
+        # that the new IF has never seen.
+        self.prev_raw = None
+        self._consec_anomaly = 0
+        self._consec_nominal = 0
+        self._mode_switch_warmup_remaining = self._mode_switch_warmup_frames
+        warmup_tag = (f", warmup {self._mode_switch_warmup_frames} frames"
+                      if self._mode_switch_warmup_frames > 0 else "")
         print(f"[iforest][route] scenario {old_scn} → {new_scenario} "
               f"at frame={self._frame_count + 1}; "
-              f"threshold {old_thr:+.5f} → {self.threshold:+.5f}")
+              f"threshold {old_thr:+.5f} → {self.threshold:+.5f}"
+              f"{warmup_tag}")
 
     def update(self, low_level_data=None, high_level_data=None):
         if not low_level_data:
@@ -540,7 +595,10 @@ class Plugin(AIPlugin):
                 delta = np.zeros_like(raw)
             else:
                 delta = raw - self.prev_raw
-            features = np.concatenate([raw, delta])
+            if self._raw_keep_mask is not None:
+                features = np.concatenate([raw[self._raw_keep_mask], delta])
+            else:
+                features = np.concatenate([raw, delta])
         else:
             features = raw
 
@@ -559,7 +617,11 @@ class Plugin(AIPlugin):
         # log lines reflect the *operational* state, not the raw per-frame
         # is_anomaly (which is preserved verbatim in the side-file for
         # offline analysis).
-        in_warmup = self._frame_count <= self._warmup_frames
+        in_cold_warmup = self._frame_count <= self._warmup_frames
+        in_mode_warmup = self._mode_switch_warmup_remaining > 0
+        in_warmup = in_cold_warmup or in_mode_warmup
+        if in_mode_warmup:
+            self._mode_switch_warmup_remaining -= 1
         alert = False
         cleared = False
         if not in_warmup:
