@@ -146,6 +146,12 @@ class Plugin(AIPlugin):
         "AlertHysteresis": "3",
         "ClearHysteresis": "5",
         "IncidentMinAnomalyFrames": "1",
+        # ─── NOS3-312: explanation catalog ───────────────────────────
+        # Per-class "top telemetry fields that drive this class", precomputed
+        # offline by build_explanation_catalog.py (the flight runtime has no
+        # shap). Empty ⇒ derive as a sibling of the classifier pickle; missing
+        # file ⇒ incidents simply omit the explanation column.
+        "ExplanationCatalogPath": "",
     }
 
     def __init__(self, name, headers):
@@ -196,6 +202,32 @@ class Plugin(AIPlugin):
         else:
             print(f"[xgb_cls] no cluster taxonomy at {tax_path}; "
                   f"reporting raw sub-techniques")
+
+        # ─── NOS3-312: explanation catalog ───────────────────────────
+        # Per-class top telemetry fields that drive the classification,
+        # precomputed offline (no shap in the flight runtime). Attached to each
+        # incident's side-file row. Missing ⇒ incidents omit the column.
+        cat_path = cfg.get("explanationcatalogpath",
+                           self.DEFAULTS["ExplanationCatalogPath"]).strip()
+        if not cat_path:
+            cat_path = os.path.join(os.path.dirname(self.classifier_path),
+                                    "explanation_catalog.json")
+        self._explanation_str: dict[str, str] = {}
+        if os.path.exists(cat_path):
+            try:
+                with open(cat_path) as f:
+                    cat = json.load(f)
+                self._explanation_str = {
+                    cls: e.get("top_features_str", "")
+                    for cls, e in (cat.get("classes") or {}).items()
+                }
+                print(f"[xgb_cls] explanation catalog: {os.path.basename(cat_path)} "
+                      f"({len(self._explanation_str)} classes)")
+            except (OSError, json.JSONDecodeError, KeyError) as e:
+                print(f"[xgb_cls] WARNING: explanation catalog unreadable ({e!r})")
+        else:
+            print(f"[xgb_cls] no explanation catalog at {cat_path}; "
+                  f"incidents will omit explanations")
 
         # ─── Load gating IF + per-mode thresholds ────────────────────
         self.if_path = cfg.get("ifmodelpath", self.DEFAULTS["IfModelPath"])
@@ -495,23 +527,31 @@ class Plugin(AIPlugin):
                   f"if_score={if_score:+.4f} → {predicted_cluster} "
                   f"({top1_prob*100:.0f}%)")
 
+    def _explanation_for(self, inc) -> str:
+        """NOS3-312: precomputed top telemetry fields for this incident's winning
+        sub-technique (falling back to its cluster). Empty if not catalogued."""
+        return (self._explanation_str.get(inc.sub_technique)
+                or self._explanation_str.get(inc.cluster) or "")
+
     def _handle_incident(self, inc) -> None:
         """Write a closed incident to the incident side-file + log a summary."""
         self._n_incidents += 1
+        explanation = self._explanation_for(inc)
         print(f"[xgb_cls][INCIDENT #{self._n_incidents}] "
               f"frames {inc.frame_start}-{inc.frame_end} "
               f"({inc.n_frames}f, {inc.n_anomaly_frames} anom) "
               f"mode={inc.mode} → {inc.cluster} "
-              f"(conf={inc.confidence:.2f}, agree={inc.agreement:.0%})")
+              f"(conf={inc.confidence:.2f}, agree={inc.agreement:.0%})"
+              + (f" ⟨{explanation}⟩" if explanation else ""))
         if self._incident_file_path is None:
             return
         write_header = not self._incident_header_written
         with open(self._incident_file_path, "a", newline="") as f:
             w = csv.writer(f)
             if write_header:
-                w.writerow(inc.header())
+                w.writerow(inc.header() + ["explanation"])
                 self._incident_header_written = True
-            w.writerow(inc.as_row())
+            w.writerow(inc.as_row() + [explanation])
 
     def _side_file_append(self, if_score: float, mode: str,
                           predicted_class: str, predicted_cluster: str,
