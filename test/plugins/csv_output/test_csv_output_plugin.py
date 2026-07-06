@@ -132,6 +132,11 @@ def test_render_reasoning_writes_header_then_data_to_first_file(isolated_outdir)
     assert contents == ['h1,h2', 'v1,v2']
 
 
+def _list_csv_files(outdir):
+    """Filter to .csv files; the writer also drops .meta.json sidecars."""
+    return sorted(f for f in os.listdir(outdir) if f.endswith('.csv'))
+
+
 def test_render_reasoning_rotates_after_lines_per_file(isolated_outdir):
     csv_out = CSV_Output(MagicMock(), ['h1', 'h2'])
     csv_out.lines_per_file = 1  # rotate after every data row
@@ -140,7 +145,7 @@ def test_render_reasoning_rotates_after_lines_per_file(isolated_outdir):
     csv_out.update(['c', 'd'], {}); csv_out.render_reasoning()
     csv_out.update(['e', 'f'], {}); csv_out.render_reasoning()
 
-    files = sorted(os.listdir(isolated_outdir))
+    files = _list_csv_files(isolated_outdir)
     assert len(files) == 3
     contents = [open(os.path.join(isolated_outdir, f)).read().splitlines() for f in files]
     # Each rotated file gets its own header by default.
@@ -156,10 +161,56 @@ def test_render_reasoning_suppresses_header_when_configured(isolated_outdir):
     csv_out.update(['c', 'd'], {}); csv_out.render_reasoning()
     csv_out.update(['e', 'f'], {}); csv_out.render_reasoning()
 
-    files = sorted(os.listdir(isolated_outdir))
+    files = _list_csv_files(isolated_outdir)
     contents = [open(os.path.join(isolated_outdir, f)).read().splitlines() for f in files]
     # First file has the header; rotated files do not.
     assert contents == [['h1,h2', 'a,b'], ['c,d'], ['e,f']]
+
+
+def test_exclude_columns_drops_specified_headers_and_aligned_data(isolated_outdir):
+    csv_out = CSV_Output(MagicMock(), ['keep1', 'drop_me', 'keep2', 'also_drop'])
+    csv_out.exclude_columns = {'drop_me', 'also_drop'}
+
+    csv_out.update(['k1v', 'dv', 'k2v', 'adv'], {})
+    csv_out.render_reasoning()
+
+    with open(csv_out.file_name) as f:
+        contents = f.read().splitlines()
+    # Header + one data row; both columns at indices 1 and 3 are dropped.
+    assert contents == ['keep1,keep2', 'k1v,k2v']
+
+
+def test_exclude_columns_unknown_name_is_a_noop(isolated_outdir):
+    csv_out = CSV_Output(MagicMock(), ['h1', 'h2'])
+    csv_out.exclude_columns = {'not_a_real_header'}
+
+    csv_out.update(['a', 'b'], {})
+    csv_out.render_reasoning()
+
+    with open(csv_out.file_name) as f:
+        contents = f.read().splitlines()
+    assert contents == ['h1,h2', 'a,b']
+
+
+def test_meta_sidecar_written_at_file_creation(isolated_outdir):
+    import json
+    csv_out = CSV_Output(MagicMock(), ['h1', 'h2', 'drop'])
+    csv_out.exclude_columns = {'drop'}
+
+    csv_out.update(['v1', 'v2', 'v3'], {})
+    csv_out.render_reasoning()
+
+    sidecar = csv_out.file_name[:-4] + '.meta.json'
+    assert os.path.exists(sidecar), 'meta sidecar should be written at file creation'
+    meta = json.loads(open(sidecar).read())
+    assert meta['csv_basename'] == os.path.basename(csv_out.file_name)
+    assert meta['pid'] == os.getpid()
+    assert meta['kept_columns'] == ['h1', 'h2']
+    assert meta['kept_columns_count'] == 2
+    assert meta['excluded_columns'] == ['drop']
+    assert 'container' in meta
+    assert 'plugin_version' in meta
+    # schema_sha256 may be None when no [FILES] section in active ini
 
 
 def test_ini_overrides_defaults(monkeypatch, tmp_path):
@@ -169,6 +220,7 @@ def test_ini_overrides_defaults(monkeypatch, tmp_path):
         f'OutputDir = {tmp_path}\n'
         'LinesPerFile = 7\n'
         'WriteHeaderOnRotation = false\n'
+        'ExcludeColumns = foo, bar ,baz\n'
     )
     monkeypatch.setenv('ONAIR_INI_FILE', str(ini))
 
@@ -176,3 +228,4 @@ def test_ini_overrides_defaults(monkeypatch, tmp_path):
     assert csv_out.output_dir == str(tmp_path)
     assert csv_out.lines_per_file == 7
     assert csv_out.write_header_on_rotation is False
+    assert csv_out.exclude_columns == {'foo', 'bar', 'baz'}
