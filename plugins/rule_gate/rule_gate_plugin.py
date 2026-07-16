@@ -48,8 +48,19 @@ import csv
 import datetime
 import os
 import re
+import sys as _sys
 
 from onair.src.ai_components.ai_plugin_abstract.ai_plugin import AIPlugin
+
+# Reuse the incident aggregator (NOS3-201) that ships in the sibling
+# xgb_classifier plugin package, so rule-gate alerts fold into the SAME Incident
+# format the IF→classifier path uses (operators OR the two incident streams).
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "xgb_classifier"))
+from incident import IncidentAggregator  # noqa: E402
+
+
+# ADCS mode enum → name (matches run_attack.py / the IF routing).
+_MODE_NAME = {0: "PASSIVE", 1: "BDOT", 2: "SUNSAFE", 3: "INERTIAL"}
 
 
 # rule-id prefix → operator-readable technique label
@@ -78,6 +89,30 @@ def _device_label(rule_id: str) -> str:
     return f"{comp} subsystem disabled (DE-0002.03 inhibit)"
 
 
+def _incident_label(active_rules):
+    """(cluster, sub_technique) for the primary active rule — the incident label.
+
+    Priority device-disable > evs-flood > cmd-error > sb-error, so a DE-0010 flood
+    (which fires R2+R3) labels as DE-0010, and a sensor disable as its technique.
+    """
+    def _prio(r):
+        return {"R1": 0, "R2": 1, "R4": 2, "R3": 3}.get(r.split(":", 1)[0], 4)
+    if not active_rules:
+        return "", ""
+    r = min(active_rules, key=_prio)
+    if r.startswith("R1:"):
+        comp = r.split(":", 1)[1].rsplit("-", 1)[0]
+        cluster = ("EX-0002" if comp.startswith("NOVATEL")
+                   else "EX-0014.03" if comp in ("IMU", "MAG", "CSS", "FSS", "ST")
+                   else "DE-0002.03")
+        return cluster, f"{comp}-disabled"
+    if r == "R2:evs":
+        return "DE-0010", "evs-flood"
+    if r == "R3:sb":
+        return "DE-0010", "sb-send-errors"
+    return "cmd-errors", r.split(":", 1)[1]
+
+
 class Plugin(AIPlugin):
     """Rule/threshold gate for state-change attacks the dynamics-IF misses."""
 
@@ -100,6 +135,13 @@ class Plugin(AIPlugin):
         "SbErrThreshold": "0",      # any SB send-error increment
         "CmdErrThreshold": "3",     # command errors/frame
         "HeartbeatEvery": "1000",
+        # Incident aggregation (NOS3-201). The rule-gate's leaky integrator
+        # already smoothed flicker, so the incident layer's own hysteresis is
+        # small — it just folds a sustained alert into one labeled incident.
+        "WriteIncidentFile": "true",
+        "IncidentAlertHysteresis": "1",
+        "IncidentClearHysteresis": "3",
+        "IncidentMinAnomalyFrames": "3",
     }
 
     def __init__(self, name, headers):
@@ -128,6 +170,7 @@ class Plugin(AIPlugin):
                             if re.search(r"CommandError(Count|Counter)$", h)}
         self._evs_idx = idx.get("CFE_EVS_HK.MessageSendCounter")
         self._sb_idx = idx.get("CFE_SB.MsgSendErrorCounter")
+        self._mode_idx = idx.get("ADCS_GNC.Mode")
 
         # The full set of rule-ids that can ever fire (so the leaky counter
         # decays even on frames a rule is quiet).
@@ -150,16 +193,29 @@ class Plugin(AIPlugin):
         self._frame_count = 0
         self._latest_active = []
 
-        # Side-file setup (mirrors the IF plugin).
+        # Incident aggregation (NOS3-201): fold rule-gate alerts into the same
+        # labeled Incident format the IF→classifier path emits.
+        self._incident_agg = IncidentAggregator(
+            alert_hysteresis=_int("IncidentAlertHysteresis"),
+            clear_hysteresis=_int("IncidentClearHysteresis"),
+            min_anomaly_frames=_int("IncidentMinAnomalyFrames"))
+        self._incident_file_path = None
+        self._incident_header_written = False
+        self._n_incidents = 0
+
+        # Side-file + incident-file setup (mirrors the IF/classifier plugins).
         self._side_file_path = None
         self._side_file_buffer = []
         self._side_file_header_written = False
         self._side_file_flush_every = _int("SideFileFlushEvery")
+        out_dir = cfg.get("sidefileoutputdir", self.DEFAULTS["SideFileOutputDir"])
+        ts = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
         if cfg.get("writesidefile", self.DEFAULTS["WriteSideFile"]).strip().lower() == "true":
-            out_dir = cfg.get("sidefileoutputdir", self.DEFAULTS["SideFileOutputDir"])
             os.makedirs(out_dir, exist_ok=True)
-            ts = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
             self._side_file_path = os.path.join(out_dir, f"rule_gate_out_{ts}_pid{os.getpid()}.csv")
+        if cfg.get("writeincidentfile", self.DEFAULTS["WriteIncidentFile"]).strip().lower() == "true":
+            os.makedirs(out_dir, exist_ok=True)
+            self._incident_file_path = os.path.join(out_dir, f"rule_gate_incident_{ts}_pid{os.getpid()}.csv")
 
         print(f"[rule_gate] watching {len(self._enable_idx)} DeviceEnabled flags, "
               f"{len(self._cmderr_idx)} cmd-err counters, "
@@ -169,6 +225,9 @@ class Plugin(AIPlugin):
               f"(+{self._fire_inc}/-{self._decay}, alert>={self._alert_level}, clear<={self._clear_level})")
         if self._side_file_path is not None:
             print(f"[rule_gate] side-file → {self._side_file_path}")
+        if self._incident_file_path is not None:
+            print(f"[rule_gate] incident-file → {self._incident_file_path} "
+                  f"(alert/clear hyst {self._incident_agg.alert_hyst}/{self._incident_agg.clear_hyst})")
 
     @staticmethod
     def _load_config():
@@ -238,6 +297,25 @@ class Plugin(AIPlugin):
 
         self._latest_active = sorted(r for r, a in self._rule_active.items() if a)
 
+        # ── Fold the alert into a labeled incident (NOS3-201) ───────────────
+        # R3 (SB send-errors) is a noisy background artifact in NOS3 — a stack
+        # with an unconnected downlink spams RADIO device-HK failures that climb
+        # CFE_SB.MsgSendErrorCounter continuously (measured ~8/frame nominal). It
+        # stays in the alert stream / side-file as a corroborator, but it must
+        # NOT drive an incident on its own, or the incident never closes. The
+        # incident is driven by the *specific* rules (R1 device-disable, R2
+        # EVS-flood, R4 cmd-errors).
+        if not in_warmup:
+            incident_active = [r for r in self._latest_active if not r.startswith("R3:")]
+            mode = _MODE_NAME.get(int(m), str(m)) if (m := val(self._mode_idx)) is not None else ""
+            cluster, sub = _incident_label(incident_active)
+            closed = self._incident_agg.update(
+                self._frame_count - 1, bool(incident_active),
+                mode=mode, cluster=cluster, sub_technique=sub,
+                confidence=1.0 if incident_active else 0.0)
+            if closed is not None:
+                self._write_incident(closed)
+
         for kind, r in edge:
             label = _TECH_LABEL.get(r) or (_device_label(r) if r.startswith("R1:")
                                            else r.split(":", 1)[1])
@@ -261,8 +339,27 @@ class Plugin(AIPlugin):
         return {
             "rule_gate_alert": bool(self._latest_active),
             "active_rules": self._latest_active,
+            "n_incidents": self._n_incidents,
             "frame": self._frame_count,
         }
+
+    def _write_incident(self, incident):
+        """Append a closed rule-gate incident (same Incident row format as the
+        IF→classifier incident file, so the two streams merge downstream)."""
+        self._n_incidents += 1
+        print(f"[rule_gate][INCIDENT] #{self._n_incidents} "
+              f"frames {incident.frame_start}-{incident.frame_end} "
+              f"({incident.n_frames}f) mode={incident.mode} "
+              f"cluster={incident.cluster} sub={incident.sub_technique}")
+        if self._incident_file_path is None:
+            return
+        write_header = not self._incident_header_written
+        with open(self._incident_file_path, "a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(incident.header())
+                self._incident_header_written = True
+            w.writerow(incident.as_row())
 
     def _flush_side_file(self):
         if self._side_file_path is None or not self._side_file_buffer:

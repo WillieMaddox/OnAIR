@@ -1,17 +1,25 @@
 # GSC-19165-1 OnAIR — rule_gate plugin tests
-import os, io, contextlib
+import os, io, contextlib, tempfile
 import pytest
 
 import sys
 # onair package importable from fsw/ (conftest adds it); AIPlugin is a plain base.
 from plugins.rule_gate.rule_gate_plugin import Plugin, _to_num, _device_label
 
+# A real ini that disables file output, so construction never touches the
+# runtime-relative ../../../../data dir (unwritable from the pytest cwd). The
+# tests only inspect in-memory state / monkeypatch _write_incident.
+_TEST_INI = os.path.join(tempfile.gettempdir(), "rule_gate_test.ini")
+with open(_TEST_INI, "w") as _f:
+    _f.write("[RULE_GATE]\nWriteSideFile=false\nWriteIncidentFile=false\n")
+
 
 def _mk(headers):
-    os.environ["ONAIR_INI_FILE"] = "/nonexistent"   # force DEFAULTS
+    os.environ["ONAIR_INI_FILE"] = _TEST_INI
     with contextlib.redirect_stdout(io.StringIO()):
         p = Plugin("rule_gate", headers)
     p._side_file_path = None
+    p._incident_file_path = None
     return p
 
 
@@ -87,3 +95,21 @@ def test_device_label_maps_technique():
     assert "EX-0002" in _device_label("R1:NOVATEL_HK-disabled")
     assert "EX-0014.03" in _device_label("R1:IMU-disabled")
     assert "DE-0002.03" in _device_label("R1:EPS-disabled")
+
+
+def test_incident_emitted_for_device_disable():
+    p = _mk(H)
+    _warmup(p)
+    # sustained disable long enough to open + (on re-enable) close an incident
+    for _ in range(10):
+        _feed(p, H, {"IMU.DeviceEnabled": "0", "CFE_EVS_HK.MessageSendCounter": "131",
+                     "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0"})
+    closed = []
+    orig = p._write_incident
+    p._write_incident = lambda inc: closed.append(inc)
+    for _ in range(10):   # re-enable -> alert clears -> incident closes
+        _feed(p, H, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": "131",
+                     "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0"})
+    assert closed, "a device-disable incident should close on re-enable"
+    inc = closed[0]
+    assert inc.cluster == "EX-0014.03" and "IMU" in inc.sub_technique
