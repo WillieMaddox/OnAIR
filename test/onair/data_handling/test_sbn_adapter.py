@@ -519,3 +519,93 @@ def test_sbn_adapter_DataSource_has_data_returns_instance_new_data():
     result = cut.has_data()
 
     assert result == expected_result
+
+# ---------------------------------------------------------------------------
+# AINOS3-30: CFE_TBL name-change derived features
+# ---------------------------------------------------------------------------
+
+# _tbl_change_detect tests (pure helper, no SBN/DataSource needed)
+def test_tbl_change_detect_first_observation_is_not_an_event():
+    # prev_value None => boot-time load is nominal, never counts
+    changed, count, norm = sbn_adapter._tbl_change_detect("cfe_es_startup.scr", None, 0)
+    assert changed == 0
+    assert count == 0
+    assert norm == "cfe_es_startup.scr"
+
+def test_tbl_change_detect_unchanged_value_holds_count():
+    changed, count, norm = sbn_adapter._tbl_change_detect("tbl_a", "tbl_a", 3)
+    assert changed == 0
+    assert count == 3
+    assert norm == "tbl_a"
+
+def test_tbl_change_detect_changed_value_flags_and_increments():
+    changed, count, norm = sbn_adapter._tbl_change_detect("tbl_b", "tbl_a", 3)
+    assert changed == 1
+    assert count == 4
+    assert norm == "tbl_b"
+
+def test_tbl_change_detect_init_sentinel_normalizes_to_empty_string():
+    # The [0] init sentinel (a list, not a str) coerces to "" so it can be
+    # stored and compared as a string on the next frame.
+    changed, count, norm = sbn_adapter._tbl_change_detect([0], None, 0)
+    assert changed == 0
+    assert count == 0
+    assert norm == ""
+
+def test_tbl_change_detect_sequence_counts_only_transitions():
+    # Simulate a stream of frames for one field; count tracks distinct-name
+    # load events (A appears, B load, back to A) = 3 transitions after boot.
+    prev, count = None, 0
+    seq = ["A", "A", "A", "B", "B", "A", "A", "C"]
+    changes = []
+    for v in seq:
+        changed, count, prev = sbn_adapter._tbl_change_detect(v, prev, count)
+        changes.append(changed)
+    # first A is boot (no event); A->B, B->A, A->C are the three events
+    assert changes == [0, 0, 0, 1, 0, 1, 0, 1]
+    assert count == 3
+
+# _update_tbl_derived tests (writes numeric columns into a buffer)
+def test_update_tbl_derived_writes_changed_and_count_columns():
+    cut = DataSource.__new__(DataSource)
+    cut._tbl_prev = {}
+    cut._tbl_count = {}
+    # Minimal buffer with one raw field + its two derived columns
+    buf = {
+        'headers': ["CFE_TBL.LastFileLoaded",
+                    "CFE_TBL.FileLoadChanged", "CFE_TBL.FileLoadCount"],
+        'data':    ["tbl_a", [0], [0]],
+    }
+    # First observation: no event
+    cut._update_tbl_derived(buf)
+    assert buf['data'][1] == 0 and buf['data'][2] == 0
+    # A load changes the name -> event
+    buf['data'][0] = "tbl_b"
+    cut._update_tbl_derived(buf)
+    assert buf['data'][1] == 1 and buf['data'][2] == 1
+
+def test_update_tbl_derived_skips_missing_headers_defensively():
+    cut = DataSource.__new__(DataSource)
+    cut._tbl_prev = {}
+    cut._tbl_count = {}
+    # Buffer lacking the derived/raw headers entirely -> no crash, no write
+    buf = {'headers': ["CFE_ES.CommandCounter"], 'data': [5]}
+    cut._update_tbl_derived(buf)  # must not raise
+    assert buf['data'] == [5]
+
+def test_update_tbl_derived_never_leaves_list_sentinel_in_derived_cells():
+    # Regression: a buffer whose derived cells are still at their scalar-0 init
+    # (a frame emitted before any CFE_TBL message) must yield numeric values,
+    # never the [0] array sentinel — which would serialize as the non-numeric
+    # literal "[0]" and corrupt the training column.
+    cut = DataSource.__new__(DataSource)
+    cut._tbl_prev = {}
+    cut._tbl_count = {}
+    buf = {
+        'headers': ["CFE_TBL.LastFileLoaded",
+                    "CFE_TBL.FileLoadChanged", "CFE_TBL.FileLoadCount"],
+        'data':    ["boot.tbl", 0, 0],  # scalar-0 init, as parse_meta_data_file sets
+    }
+    cut._update_tbl_derived(buf)
+    for cell in (buf['data'][1], buf['data'][2]):
+        assert isinstance(cell, int)  # numeric, not a list sentinel

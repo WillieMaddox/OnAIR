@@ -38,6 +38,43 @@ def _ctypes_to_python(obj):
     else:
         return obj  # already a Python scalar (int, float, bytes)
 
+# CFE_TBL name/path fields (LastFileLoaded etc.) are strings (c_char[]); the IF/
+# XGB models can't consume them, and writing them raw re-introduces the
+# text<->numeric schema drift that got them ExcludeColumns-suppressed. Instead we
+# emit two *numeric* derived columns per field: a frame-to-frame "changed" flag
+# (a table load/update event just occurred) and a monotonic count of those
+# events. This is the AINOS3-30 signal for the table-load DEAD classes
+# (DE-0003.03/.08/.09). Order here MUST match the tail of the tlm.json `order`
+# list (and thus all_headers), since the derived columns are appended to both.
+#   (raw_header, changed_col, count_col)
+_DERIVED_TBL_FIELDS = [
+    ("CFE_TBL.LastFileLoaded",   "CFE_TBL.FileLoadChanged",    "CFE_TBL.FileLoadCount"),
+    ("CFE_TBL.LastUpdatedTable", "CFE_TBL.TableUpdateChanged", "CFE_TBL.TableUpdateCount"),
+    ("CFE_TBL.LastTableLoaded",  "CFE_TBL.TableLoadChanged",   "CFE_TBL.TableLoadCount"),
+]
+
+
+def _tbl_change_detect(cur_value, prev_value, prev_count):
+    """Frame-to-frame change detection for a CFE_TBL name/path string field.
+
+    Returns (changed, count, normalized_current):
+      changed            : 1 when a non-first observation differs from the
+                           previous value (a load/update event), else 0.
+      count              : monotonic event count (prev_count, +1 on a change).
+      normalized_current : current value coerced to str ("" for the [0] init
+                           sentinel), to be stored as the next prev_value.
+
+    The first observation (prev_value is None) never counts as an event — the
+    boot-time table load is nominal, not an anomaly. These fields fire on a
+    table/file NAME change and complement CFE_TBL.LastUpdateTime* (which also
+    moves on a same-name content reload)."""
+    cur = cur_value if isinstance(cur_value, str) else ""
+    if prev_value is None:
+        return 0, prev_count, cur
+    if cur != prev_value:
+        return 1, prev_count + 1, cur
+    return 0, prev_count, cur
+
 # Note: The double buffer does not clear between switching. If fresh data doesn't come in, stale data is returned (delayed by 1 frame)
 
 class DataSource(OnAirDataSource):
@@ -48,6 +85,11 @@ class DataSource(OnAirDataSource):
         self.new_data_lock = threading.Lock()
         self.new_data = False
         self.double_buffer_read_index = 0
+        # Per-field state for CFE_TBL name-change detection (see
+        # _DERIVED_TBL_FIELDS / _update_tbl_derived). Initialized before
+        # connect() launches the listener thread that reads them.
+        self._tbl_prev = {}
+        self._tbl_count = {}
         self.connect()
 
     def connect(self):
@@ -117,6 +159,25 @@ class DataSource(OnAirDataSource):
                     for field_name in field_names:
                         self.currentData[x]['headers'].append(field_name)
                         self.currentData[x]['data'].append([0]) #initialize all the data arrays with zero
+
+            # Derived CFE_TBL name-change features (numeric). Appended AFTER all
+            # struct fields, and ONLY when the raw source field is present in
+            # this schema — so a schema without CFE_TBL (or without these entries
+            # in its `order` list) doesn't gain currentData columns that
+            # all_headers lacks. The tlm.json `order` tail must list exactly the
+            # derived columns whose raw field is subscribed. get_current_data()
+            # populates them.
+            for raw_h, changed_h, count_h in _DERIVED_TBL_FIELDS:
+                if raw_h not in self.currentData[x]['headers']:
+                    continue
+                # Init to scalar 0 (NOT the [0] array sentinel used for struct
+                # fields): these are scalars, and a frame emitted from a buffer
+                # that hasn't yet processed a CFE_TBL message must still read a
+                # numeric 0, never the literal "[0]" string in the CSV.
+                self.currentData[x]['headers'].append(changed_h)
+                self.currentData[x]['data'].append(0)
+                self.currentData[x]['headers'].append(count_h)
+                self.currentData[x]['data'].append(0)
         print("Current Data Headers: {}.".format(self.currentData[0]["headers"]))
         return extract_meta_data_handle_ss_breakdown(meta_data_file, ss_breakdown)
 
@@ -212,8 +273,38 @@ class DataSource(OnAirDataSource):
                     data = str(current_object)
                 current_buffer['data'][idx] = data
 
+        # Once the raw CFE_TBL name fields for this frame are populated, derive
+        # their numeric change-detection columns (AINOS3-30).
+        if app_name == "CFE_TBL":
+            self._update_tbl_derived(current_buffer)
+
         with self.new_data_lock:
             self.new_data = True
+
+    def _update_tbl_derived(self, current_buffer):
+        """Write the numeric CFE_TBL name-change features into current_buffer.
+
+        Reads each raw name/path field (already populated for this frame),
+        computes its frame-to-frame change flag + monotonic event count via
+        _tbl_change_detect, and stores them in the paired derived columns.
+        State (previous value + count) is kept per-field on the instance so it
+        persists across frames. A missing header is skipped defensively."""
+        headers = current_buffer['headers']
+        data = current_buffer['data']
+        for raw_h, changed_h, count_h in _DERIVED_TBL_FIELDS:
+            try:
+                raw_val = data[headers.index(raw_h)]
+            except ValueError:
+                continue
+            changed, count, norm = _tbl_change_detect(
+                raw_val, self._tbl_prev.get(raw_h), self._tbl_count.get(raw_h, 0))
+            self._tbl_prev[raw_h] = norm
+            self._tbl_count[raw_h] = count
+            try:
+                data[headers.index(changed_h)] = changed
+                data[headers.index(count_h)] = count
+            except ValueError:
+                pass
 
     def has_data(self):
         return self.new_data
