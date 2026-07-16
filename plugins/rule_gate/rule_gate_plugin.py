@@ -23,6 +23,11 @@ the IF's high_level_data) and fires on:
   R2 evs-flood      : CFE_EVS_HK.MessageSendCounter per-frame delta > threshold.
   R3 sb-errors      : CFE_SB.MsgSendErrorCounter per-frame delta > 0.
   R4 cmd-errors     : any `*.CommandError{Count,Counter}` per-frame delta > thresh.
+  R5 monitor-state  : a monitoring/limit-check state field (e.g. LC.CurrentLCState)
+                      leaves its protective session baseline — the safe-mode
+                      induction step (EX-0011/DE-0005) that disables LC/HS/limit
+                      checking. Validated 2026-07-16: LC.CurrentLCState 1→3 was
+                      blind to both the dynamics-IF and the other rule-gate rules.
 
 The rule that fires IS the label (R1:NOVATEL → GPS disable, etc.), so no XGBoost
 classifier is needed for this class. The two gates are complementary: the IF owns
@@ -89,14 +94,22 @@ def _device_label(rule_id: str) -> str:
     return f"{comp} subsystem disabled (DE-0002.03 inhibit)"
 
 
+def _monstate_label(rule_id: str) -> str:
+    """Human label for an R5 monitor-state alert (rule-id `R5:{app}-monstate`)."""
+    app = rule_id.split(":", 1)[1].rsplit("-", 1)[0]
+    return (f"{app} monitoring/limit-check state left its protective baseline "
+            f"(EX-0011 safe-mode induction / DE-0005)")
+
+
 def _incident_label(active_rules):
     """(cluster, sub_technique) for the primary active rule — the incident label.
 
-    Priority device-disable > evs-flood > cmd-error > sb-error, so a DE-0010 flood
-    (which fires R2+R3) labels as DE-0010, and a sensor disable as its technique.
+    Priority device-disable > monitor-state > evs-flood > cmd-error > sb-error, so
+    a DE-0010 flood (which fires R2+R3) labels as DE-0010, a sensor disable as its
+    technique, and an LC/HS monitoring-disable as EX-0011.
     """
     def _prio(r):
-        return {"R1": 0, "R2": 1, "R4": 2, "R3": 3}.get(r.split(":", 1)[0], 4)
+        return {"R1": 0, "R5": 1, "R2": 2, "R4": 3, "R3": 4}.get(r.split(":", 1)[0], 5)
     if not active_rules:
         return "", ""
     r = min(active_rules, key=_prio)
@@ -106,6 +119,9 @@ def _incident_label(active_rules):
                    else "EX-0014.03" if comp in ("IMU", "MAG", "CSS", "FSS", "ST")
                    else "DE-0002.03")
         return cluster, f"{comp}-disabled"
+    if r.startswith("R5:"):
+        app = r.split(":", 1)[1].rsplit("-", 1)[0]
+        return "EX-0011", f"{app}-monitoring-disabled"
     if r == "R2:evs":
         return "DE-0010", "evs-flood"
     if r == "R3:sb":
@@ -134,6 +150,10 @@ class Plugin(AIPlugin):
         "EvsRateThreshold": "15",   # events/frame above nominal background
         "SbErrThreshold": "0",      # any SB send-error increment
         "CmdErrThreshold": "3",     # command errors/frame
+        # R5 monitor-state: comma-separated telemetry fields whose deviation from
+        # their protective session baseline is an alert (monitoring/limit-check
+        # turned off). LC.CurrentLCState: 1=ACTIVE(protective) 2=PASSIVE 3=DISABLED.
+        "MonitorStateFields": "LC.CurrentLCState",
         "HeartbeatEvery": "1000",
         # Incident aggregation (NOS3-201). The rule-gate's leaky integrator
         # already smoothed flicker, so the incident layer's own hysteresis is
@@ -171,6 +191,11 @@ class Plugin(AIPlugin):
         self._evs_idx = idx.get("CFE_EVS_HK.MessageSendCounter")
         self._sb_idx = idx.get("CFE_SB.MsgSendErrorCounter")
         self._mode_idx = idx.get("ADCS_GNC.Mode")
+        # R5 monitor-state fields present in this schema, name → column index.
+        monstate_cfg = cfg.get("monitorstatefields", self.DEFAULTS["MonitorStateFields"])
+        self._monstate_idx = {f.strip(): idx[f.strip()]
+                              for f in monstate_cfg.split(",")
+                              if f.strip() and f.strip() in idx}
 
         # The full set of rule-ids that can ever fire (so the leaky counter
         # decays even on frames a rule is quiet).
@@ -183,10 +208,15 @@ class Plugin(AIPlugin):
             self._rule_ids.add("R3:sb")
         for h in self._cmderr_idx:
             self._rule_ids.add(f"R4:{h.split('.')[0]}-cmderr")
+        for f in self._monstate_idx:
+            self._rule_ids.add(f"R5:{f.split('.')[0]}-monstate")
 
         self._activity = {r: 0.0 for r in self._rule_ids}
         self._rule_active = {r: False for r in self._rule_ids}
         self._enable_baseline = {h: 0.0 for h in self._enable_idx}
+        # R5 baseline = the protective state established during warmup (first seen,
+        # e.g. LC ACTIVE=1). None until a real value arrives; a later deviation fires.
+        self._monstate_baseline = {f: None for f in self._monstate_idx}
         self._prev_evs = None
         self._prev_sb = None
         self._prev_cmderr = {h: None for h in self._cmderr_idx}
@@ -219,6 +249,8 @@ class Plugin(AIPlugin):
 
         print(f"[rule_gate] watching {len(self._enable_idx)} DeviceEnabled flags, "
               f"{len(self._cmderr_idx)} cmd-err counters, "
+              f"{len(self._monstate_idx)} monitor-state fields "
+              f"({', '.join(self._monstate_idx) or 'none'}), "
               f"EVS={'y' if self._evs_idx is not None else 'n'} "
               f"SB={'y' if self._sb_idx is not None else 'n'}; "
               f"warmup={self._warmup_frames}, leaky "
@@ -279,6 +311,18 @@ class Plugin(AIPlugin):
                 fired.add(f"R4:{h.split('.')[0]}-cmderr")
             if v is not None:
                 self._prev_cmderr[h] = v
+        # R5 monitor-state: a watched monitoring/limit-check state field left its
+        # protective baseline (captured on first receipt, e.g. LC.CurrentLCState
+        # ACTIVE=1). A discrete flip like 1→3 (DISABLED) fires; a return to baseline
+        # clears via the leaky integrator, same as R1.
+        for f, i in self._monstate_idx.items():
+            v = val(i)
+            if v is None:
+                continue
+            if self._monstate_baseline[f] is None:
+                self._monstate_baseline[f] = v   # establish the protective baseline
+            elif v != self._monstate_baseline[f]:
+                fired.add(f"R5:{f.split('.')[0]}-monstate")
 
         # ── Leaky-integrator hysteresis + edge-triggered alert/clear ────────
         edge = []
@@ -317,8 +361,12 @@ class Plugin(AIPlugin):
                 self._write_incident(closed)
 
         for kind, r in edge:
-            label = _TECH_LABEL.get(r) or (_device_label(r) if r.startswith("R1:")
-                                           else r.split(":", 1)[1])
+            if r.startswith("R1:"):
+                label = _device_label(r)
+            elif r.startswith("R5:"):
+                label = _monstate_label(r)
+            else:
+                label = _TECH_LABEL.get(r) or r.split(":", 1)[1]
             print(f"[rule_gate][{kind}] frame={self._frame_count} rule={r} — {label}")
         if not edge and self._heartbeat_every > 0 and self._frame_count % self._heartbeat_every == 0:
             tag = " [warmup]" if in_warmup else ""

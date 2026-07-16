@@ -97,6 +97,63 @@ def test_device_label_maps_technique():
     assert "DE-0002.03" in _device_label("R1:EPS-disabled")
 
 
+# R5 monitor-state: header includes LC.CurrentLCState (the default watched field)
+HM = ["IMU.DeviceEnabled", "CFE_EVS_HK.MessageSendCounter",
+      "CFE_SB.MsgSendErrorCounter", "ADCS_HK.CommandErrorCount", "LC.CurrentLCState"]
+
+
+def _warmup_m(p, lc="1"):
+    # 31 nominal frames establishing LC baseline = ACTIVE(1)
+    for k in range(31):
+        _feed(p, HM, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": str(100 + k),
+                      "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0",
+                      "LC.CurrentLCState": lc})
+
+
+def _feed_m(p, lc):
+    _feed(p, HM, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": "131",
+                  "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0",
+                  "LC.CurrentLCState": lc})
+
+
+def test_monstate_label_maps_ex0011():
+    from plugins.rule_gate.rule_gate_plugin import _monstate_label
+    assert "EX-0011" in _monstate_label("R5:LC-monstate")
+
+
+def test_r5_monitor_state_disable_latches_and_clears():
+    p = _mk(HM)
+    _warmup_m(p)                         # LC baseline = ACTIVE(1)
+    for _ in range(6):                   # LC -> DISABLED(3), sustained
+        _feed_m(p, "3")
+    assert any("LC-monstate" in r for r in p._latest_active)
+    for _ in range(10):                  # restored to ACTIVE -> leaky decays -> clears
+        _feed_m(p, "1")
+    assert p._latest_active == []
+
+
+def test_r5_no_alert_when_lc_never_received():
+    # LC.CurrentLCState stays the [0] sentinel -> no baseline -> R5 never fires
+    p = _mk(HM)
+    for _ in range(40):
+        _feed(p, HM, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": "131",
+                      "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0"})
+    assert not any("R5" in r for r in p._latest_active)
+
+
+def test_r5_emits_ex0011_incident():
+    p = _mk(HM)
+    _warmup_m(p)
+    for _ in range(10):
+        _feed_m(p, "3")
+    closed = []
+    p._write_incident = lambda inc: closed.append(inc)
+    for _ in range(10):                  # restore -> alert clears -> incident closes
+        _feed_m(p, "1")
+    assert closed, "an LC-disable incident should close on restore"
+    assert closed[0].cluster == "EX-0011" and "LC" in closed[0].sub_technique
+
+
 def test_incident_emitted_for_device_disable():
     p = _mk(H)
     _warmup(p)
