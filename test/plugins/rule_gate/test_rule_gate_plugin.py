@@ -170,3 +170,58 @@ def test_incident_emitted_for_device_disable():
     assert closed, "a device-disable incident should close on re-enable"
     inc = closed[0]
     assert inc.cluster == "EX-0014.03" and "IMU" in inc.sub_technique
+
+
+# R6 sb-command: header includes CFE_SB.CommandCounter
+HSB = ["IMU.DeviceEnabled", "CFE_EVS_HK.MessageSendCounter",
+       "CFE_SB.MsgSendErrorCounter", "ADCS_HK.CommandErrorCount",
+       "CFE_SB.CommandCounter", "ADCS_GNC.Mode"]
+
+
+def _feed_sb(p, cc, mode="2"):
+    _feed(p, HSB, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": "131",
+                   "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0",
+                   "CFE_SB.CommandCounter": str(cc), "ADCS_GNC.Mode": mode})
+
+
+def _warmup_sb(p, cc=1):
+    for _ in range(31):
+        _feed_sb(p, cc)                       # CFE_SB.CommandCounter static at baseline
+
+
+def test_r6_sb_command_latches():
+    p = _mk(HSB)
+    _warmup_sb(p, cc=1)                        # baseline CommandCounter = 1
+    _feed_sb(p, 2)                            # a CFE_SB command: 1->2 new high -> dwell
+    for _ in range(4):                        # counter static; dwell keeps firing -> latch
+        _feed_sb(p, 2)
+    assert "R6:sb-command" in p._latest_active
+
+
+def test_r6_static_never_fires():
+    p = _mk(HSB)
+    _warmup_sb(p, cc=1)
+    for _ in range(20):                       # no command -> counter static
+        _feed_sb(p, 1)
+    assert "R6:sb-command" not in p._latest_active
+
+
+def test_r6_double_buffer_flicker_single_command():
+    # one command flickering 2<->1 (stale buffer): running max ignores the stale 1s
+    p = _mk(HSB)
+    _warmup_sb(p, cc=1)
+    for cc in [2, 1, 2, 1, 2, 1]:
+        _feed_sb(p, cc)
+    assert "R6:sb-command" in p._latest_active
+
+
+def test_r6_emits_ex0012_02_incident():
+    p = _mk(HSB)
+    _warmup_sb(p, cc=1)
+    closed = []
+    p._write_incident = lambda inc: closed.append(inc)
+    _feed_sb(p, 2)                            # command -> dwell -> latch
+    for _ in range(28):                       # counter static; dwell ends -> decays -> clears
+        _feed_sb(p, 2)
+    assert closed, "an sb-command incident should open then close"
+    assert closed[0].cluster == "EX-0012.02" and "sb-command" in closed[0].sub_technique
