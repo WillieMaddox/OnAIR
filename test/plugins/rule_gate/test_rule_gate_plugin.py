@@ -271,3 +271,51 @@ def test_r7_emits_de0002_03_incident():
         _feed_ev(p, 2)
     assert closed, "an evs-command incident should open then close"
     assert closed[0].cluster == "DE-0002.03" and "evs-command" in closed[0].sub_technique
+
+
+# R8 es-command: header includes CFE_ES.CommandCounter (static in nominal). A
+# CFE_ES command (SET_MAX_PR_COUNT etc.) modifies a C&DH on-board value the IF
+# and the consistency/staleness gates all miss — EX-0012.10.
+HES = ["IMU.DeviceEnabled", "CFE_EVS_HK.MessageSendCounter",
+       "CFE_SB.MsgSendErrorCounter", "ADCS_HK.CommandErrorCount",
+       "CFE_ES.CommandCounter", "ADCS_GNC.Mode"]
+
+
+def _feed_es(p, cc, mode="2"):
+    _feed(p, HES, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": "131",
+                   "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0",
+                   "CFE_ES.CommandCounter": str(cc), "ADCS_GNC.Mode": mode})
+
+
+def _warmup_es(p, cc=0):
+    for _ in range(31):
+        _feed_es(p, cc)
+
+
+def test_r8_es_command_latches():
+    p = _mk(HES)
+    _warmup_es(p, cc=0)                          # baseline CFE_ES CommandCounter = 0
+    _feed_es(p, 4)                              # a CFE_ES command burst: 0->4 new high
+    for _ in range(4):
+        _feed_es(p, 4)
+    assert "R8:es-command" in p._latest_active
+
+
+def test_r8_static_never_fires():
+    p = _mk(HES)
+    _warmup_es(p, cc=0)
+    for _ in range(20):                          # no command -> counter static
+        _feed_es(p, 0)
+    assert "R8:es-command" not in p._latest_active
+
+
+def test_r8_emits_ex0012_10_incident():
+    p = _mk(HES)
+    _warmup_es(p, cc=0)
+    closed = []
+    p._write_incident = lambda inc: closed.append(inc)
+    _feed_es(p, 4)                              # command -> dwell -> latch
+    for _ in range(28):                          # static; dwell ends -> decays -> clears
+        _feed_es(p, 4)
+    assert closed, "an es-command incident should open then close"
+    assert closed[0].cluster == "EX-0012.10" and "es-command" in closed[0].sub_technique
