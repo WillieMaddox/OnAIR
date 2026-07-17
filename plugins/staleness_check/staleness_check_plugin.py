@@ -205,6 +205,15 @@ class Plugin(AIPlugin):
             self._notadv[i] = 0
             if discovery and pm is not None:
                 self._advances[i] = self._advances.get(i, 0) + 1
+        elif pm > 0 and (pm - v) > 0.5 * pm:
+            # A large RELATIVE backwards drop = a counter WRAP (uint16 65535→0) or a
+            # reset — the counter is alive (it kept counting past its type max), NOT
+            # frozen. Re-baseline the running max to the post-wrap value. Without this
+            # a wrapping wide counter (e.g. uint16 DS.FileWriteCounter) pins the max at
+            # ~65515 for its whole next 0→65515 climb → a persistent false stale.
+            # (A freeze holds the value ~constant, a small/zero drop — not a wrap.)
+            self._prev_max[i] = v
+            self._notadv[i] = 0
         else:
             self._notadv[i] = self._notadv.get(i, 0) + 1
         if discovery:
