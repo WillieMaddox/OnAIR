@@ -319,3 +319,62 @@ def test_r8_emits_ex0012_10_incident():
         _feed_es(p, 4)
     assert closed, "an es-command incident should open then close"
     assert closed[0].cluster == "EX-0012.10" and "es-command" in closed[0].sub_technique
+
+
+# R9 tbl-command: header includes CFE_TBL.CommandCounter (static in nominal). A
+# CFE_TBL LOAD/ACTIVATE is table-backdoor persistence (PER-0001) the IF and the
+# consistency/staleness gates all miss.
+HTB = ["IMU.DeviceEnabled", "CFE_EVS_HK.MessageSendCounter",
+       "CFE_SB.MsgSendErrorCounter", "ADCS_HK.CommandErrorCount",
+       "CFE_TBL.CommandCounter", "ADCS_GNC.Mode"]
+
+
+def _feed_tb(p, cc, mode="2"):
+    _feed(p, HTB, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": "131",
+                   "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0",
+                   "CFE_TBL.CommandCounter": str(cc), "ADCS_GNC.Mode": mode})
+
+
+def _warmup_tb(p, cc=0):
+    for _ in range(31):
+        _feed_tb(p, cc)
+
+
+def test_r9_tbl_command_latches():
+    p = _mk(HTB)
+    _warmup_tb(p, cc=0)                          # baseline CFE_TBL CommandCounter = 0
+    _feed_tb(p, 1)                              # a CFE_TBL command: 0->1 new high
+    for _ in range(4):
+        _feed_tb(p, 1)
+    assert "R9:tbl-command" in p._latest_active
+
+
+def test_r9_survives_evidence_hiding_reset():
+    p = _mk(HTB)
+    _warmup_tb(p, cc=0)
+    _feed_tb(p, 2)                              # commands land: new high 0->2
+    _feed_tb(p, 0)                              # attacker CFE_TBL_RESET zeroes it
+    for _ in range(3):
+        _feed_tb(p, 0)
+    # the running-max latched the new high before the reset -> still alerting via dwell
+    assert "R9:tbl-command" in p._latest_active
+
+
+def test_r9_static_never_fires():
+    p = _mk(HTB)
+    _warmup_tb(p, cc=0)
+    for _ in range(20):
+        _feed_tb(p, 0)
+    assert "R9:tbl-command" not in p._latest_active
+
+
+def test_r9_emits_per0001_incident():
+    p = _mk(HTB)
+    _warmup_tb(p, cc=0)
+    closed = []
+    p._write_incident = lambda inc: closed.append(inc)
+    _feed_tb(p, 1)
+    for _ in range(28):
+        _feed_tb(p, 1)
+    assert closed, "a tbl-command incident should open then close"
+    assert closed[0].cluster == "PER-0001" and "tbl-command" in closed[0].sub_technique

@@ -46,6 +46,11 @@ the IF's high_level_data) and fires on:
                       new-high + dwell mechanism as R6/R7. The IF is CDH-blind and the
                       consistency/staleness gates miss it (the value goes UP, the
                       stream never freezes), so this rule is the only catch.
+  R9 tbl-command    : CFE_TBL.CommandCounter reaches a new high — a CFE_TBL command
+                      (LOAD/ACTIVATE = table-backdoor persistence, PER-0001). Static in
+                      nominal (nothing loads tables in steady state). Same mechanism as
+                      R6/R7/R8; the running-max survives the attacker's evidence-hiding
+                      CFE_TBL_RESET (the new high is latched before the reset zeroes it).
 
 The rule that fires IS the label (R1:NOVATEL → GPS disable, etc.), so no XGBoost
 classifier is needed for this class. The two gates are complementary: the IF owns
@@ -93,6 +98,7 @@ _TECH_LABEL = {
     "R6:sb-command": "CFE_SB command — routing/subscription modification (EX-0012.02)",
     "R7:evs-command": "CFE_EVS command — event-type suppression / inhibit (DE-0002.03)",
     "R8:es-command": "CFE_ES command — C&DH on-board value modification (EX-0012.10)",
+    "R9:tbl-command": "CFE_TBL command — table load/activate persistence (PER-0001)",
 }
 
 
@@ -130,7 +136,7 @@ def _incident_label(active_rules):
     disable as its technique, and an LC/HS monitoring-disable as EX-0011.
     """
     def _prio(r):
-        return {"R1": 0, "R5": 1, "R6": 2, "R7": 2, "R8": 2, "R2": 3, "R4": 4, "R3": 5}.get(r.split(":", 1)[0], 6)
+        return {"R1": 0, "R5": 1, "R6": 2, "R7": 2, "R8": 2, "R9": 2, "R2": 3, "R4": 4, "R3": 5}.get(r.split(":", 1)[0], 6)
     if not active_rules:
         return "", ""
     r = min(active_rules, key=_prio)
@@ -149,6 +155,8 @@ def _incident_label(active_rules):
         return "DE-0002.03", "evs-command"
     if r == "R8:es-command":
         return "EX-0012.10", "es-command"
+    if r == "R9:tbl-command":
+        return "PER-0001", "tbl-command"
     if r == "R2:evs":
         return "DE-0010", "evs-flood"
     if r == "R3:sb":
@@ -233,7 +241,8 @@ class Plugin(AIPlugin):
         self._cmd_rule = {}
         for field, rid in (("CFE_SB.CommandCounter", "R6:sb-command"),
                            ("CFE_EVS_HK.CommandCounter", "R7:evs-command"),
-                           ("CFE_ES.CommandCounter", "R8:es-command")):
+                           ("CFE_ES.CommandCounter", "R8:es-command"),
+                           ("CFE_TBL.CommandCounter", "R9:tbl-command")):
             if field in idx:
                 self._cmd_rule[idx[field]] = rid
         # R5 monitor-state fields present in this schema, name → column index.
