@@ -225,3 +225,49 @@ def test_r6_emits_ex0012_02_incident():
         _feed_sb(p, 2)
     assert closed, "an sb-command incident should open then close"
     assert closed[0].cluster == "EX-0012.02" and "sb-command" in closed[0].sub_technique
+
+
+# R7 evs-command: header includes CFE_EVS_HK.CommandCounter (static in nominal)
+HEV = ["IMU.DeviceEnabled", "CFE_EVS_HK.MessageSendCounter",
+       "CFE_SB.MsgSendErrorCounter", "ADCS_HK.CommandErrorCount",
+       "CFE_EVS_HK.CommandCounter", "ADCS_GNC.Mode"]
+
+
+def _feed_ev(p, cc, mode="2"):
+    _feed(p, HEV, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": "131",
+                   "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0",
+                   "CFE_EVS_HK.CommandCounter": str(cc), "ADCS_GNC.Mode": mode})
+
+
+def _warmup_ev(p, cc=1):
+    for _ in range(31):
+        _feed_ev(p, cc)
+
+
+def test_r7_evs_command_latches():
+    p = _mk(HEV)
+    _warmup_ev(p, cc=1)                          # baseline CFE_EVS CommandCounter = 1
+    _feed_ev(p, 2)                              # a CFE_EVS command: 1->2 new high -> dwell
+    for _ in range(4):
+        _feed_ev(p, 2)
+    assert "R7:evs-command" in p._latest_active
+
+
+def test_r7_static_never_fires():
+    p = _mk(HEV)
+    _warmup_ev(p, cc=1)
+    for _ in range(20):                          # no command -> counter static
+        _feed_ev(p, 1)
+    assert "R7:evs-command" not in p._latest_active
+
+
+def test_r7_emits_de0002_03_incident():
+    p = _mk(HEV)
+    _warmup_ev(p, cc=1)
+    closed = []
+    p._write_incident = lambda inc: closed.append(inc)
+    _feed_ev(p, 2)                              # command -> dwell -> latch
+    for _ in range(28):                          # static; dwell ends -> decays -> clears
+        _feed_ev(p, 2)
+    assert closed, "an evs-command incident should open then close"
+    assert closed[0].cluster == "DE-0002.03" and "evs-command" in closed[0].sub_technique

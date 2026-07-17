@@ -34,6 +34,11 @@ the IF's high_level_data) and fires on:
                       signal — a lower-latency catch than the staleness gate's freeze
                       detection. A single-step signal held for a short dwell so the
                       leaky integrator latches one bounded incident per command.
+  R7 evs-command    : CFE_EVS_HK.CommandCounter reaches a new high — a CFE_EVS command
+                      (DISABLE_EVENT_TYPE = DE-0002.03 telemetry inhibit). Same
+                      mechanism as R6 (static-in-nominal counter → new-high + dwell);
+                      the low-latency command catch for the same freeze the staleness
+                      gate detects via CFE_EVS_HK.MessageSendCounter going quiet.
 
 The rule that fires IS the label (R1:NOVATEL → GPS disable, etc.), so no XGBoost
 classifier is needed for this class. The two gates are complementary: the IF owns
@@ -79,6 +84,7 @@ _TECH_LABEL = {
     "R2:evs": "EVS event-log flood (DE-0010 overflow-audit-log)",
     "R3:sb": "Software Bus send errors",
     "R6:sb-command": "CFE_SB command — routing/subscription modification (EX-0012.02)",
+    "R7:evs-command": "CFE_EVS command — event-type suppression / inhibit (DE-0002.03)",
 }
 
 
@@ -111,12 +117,12 @@ def _monstate_label(rule_id: str) -> str:
 def _incident_label(active_rules):
     """(cluster, sub_technique) for the primary active rule — the incident label.
 
-    Priority device-disable > monitor-state > sb-command > evs-flood > cmd-error >
-    sb-error, so a DE-0010 flood (which fires R2+R3) labels as DE-0010, a sensor
+    Priority device-disable > monitor-state > sb/evs-command > evs-flood > cmd-error
+    > sb-error, so a DE-0010 flood (which fires R2+R3) labels as DE-0010, a sensor
     disable as its technique, and an LC/HS monitoring-disable as EX-0011.
     """
     def _prio(r):
-        return {"R1": 0, "R5": 1, "R6": 2, "R2": 3, "R4": 4, "R3": 5}.get(r.split(":", 1)[0], 6)
+        return {"R1": 0, "R5": 1, "R6": 2, "R7": 2, "R2": 3, "R4": 4, "R3": 5}.get(r.split(":", 1)[0], 6)
     if not active_rules:
         return "", ""
     r = min(active_rules, key=_prio)
@@ -131,6 +137,8 @@ def _incident_label(active_rules):
         return "EX-0011", f"{app}-monitoring-disabled"
     if r == "R6:sb-command":
         return "EX-0012.02", "sb-command"
+    if r == "R7:evs-command":
+        return "DE-0002.03", "evs-command"
     if r == "R2:evs":
         return "DE-0010", "evs-flood"
     if r == "R3:sb":
@@ -163,13 +171,13 @@ class Plugin(AIPlugin):
         # their protective session baseline is an alert (monitoring/limit-check
         # turned off). LC.CurrentLCState: 1=ACTIVE(protective) 2=PASSIVE 3=DISABLED.
         "MonitorStateFields": "LC.CurrentLCState",
-        # R6 sb-command: CFE_SB.CommandCounter is static in nominal ops (nothing
-        # commands the Software Bus), so any increment = a CFE_SB command
-        # (ENABLE/DISABLE_ROUTE, subscription report, …) — the direct signal of the
-        # EX-0012.02 routing-table attack. A command is a single new-high step, so we
-        # hold the fire for SbCmdDwell frames to let the leaky integrator latch one
-        # clean bounded incident per command.
-        "SbCmdDwell": "8",
+        # R6/R7 command rules: CFE_SB.CommandCounter and CFE_EVS_HK.CommandCounter are
+        # STATIC in nominal ops (nothing routinely commands the Software Bus or Event
+        # Services), so any increment = an attacker command — R6 CFE_SB
+        # (ENABLE/DISABLE_ROUTE = EX-0012.02 routing), R7 CFE_EVS (DISABLE_EVENT_TYPE =
+        # DE-0002.03 inhibit). A command is a single new-high step, so we hold the fire
+        # for CmdDwell frames to let the leaky integrator latch one bounded incident.
+        "CmdDwell": "8",
         "HeartbeatEvery": "1000",
         # Incident aggregation (NOS3-201). The rule-gate's leaky integrator
         # already smoothed flicker, so the incident layer's own hysteresis is
@@ -207,9 +215,15 @@ class Plugin(AIPlugin):
         self._evs_idx = idx.get("CFE_EVS_HK.MessageSendCounter")
         self._sb_idx = idx.get("CFE_SB.MsgSendErrorCounter")
         self._mode_idx = idx.get("ADCS_GNC.Mode")
-        # R6 sb-command: CFE_SB.CommandCounter (any command to the Software Bus).
-        self._sb_cmd_idx = idx.get("CFE_SB.CommandCounter")
-        self._sb_cmd_dwell_frames = _int("SbCmdDwell")
+        # R6/R7 command rules: a `*.CommandCounter` that is STATIC in nominal ops
+        # (nothing routinely commands the Software Bus / Event Services), so any new
+        # high is an attacker command. col index → rule-id (present fields only).
+        self._cmd_dwell_frames = _int("CmdDwell")
+        self._cmd_rule = {}
+        for field, rid in (("CFE_SB.CommandCounter", "R6:sb-command"),
+                           ("CFE_EVS_HK.CommandCounter", "R7:evs-command")):
+            if field in idx:
+                self._cmd_rule[idx[field]] = rid
         # R5 monitor-state fields present in this schema, name → column index.
         monstate_cfg = cfg.get("monitorstatefields", self.DEFAULTS["MonitorStateFields"])
         self._monstate_idx = {f.strip(): idx[f.strip()]
@@ -229,8 +243,8 @@ class Plugin(AIPlugin):
             self._rule_ids.add(f"R4:{h.split('.')[0]}-cmderr")
         for f in self._monstate_idx:
             self._rule_ids.add(f"R5:{f.split('.')[0]}-monstate")
-        if self._sb_cmd_idx is not None:
-            self._rule_ids.add("R6:sb-command")
+        for rid in self._cmd_rule.values():
+            self._rule_ids.add(rid)
 
         self._activity = {r: 0.0 for r in self._rule_ids}
         self._rule_active = {r: False for r in self._rule_ids}
@@ -238,10 +252,10 @@ class Plugin(AIPlugin):
         # R5 baseline = the protective state established during warmup (first seen,
         # e.g. LC ACTIVE=1). None until a real value arrives; a later deviation fires.
         self._monstate_baseline = {f: None for f in self._monstate_idx}
-        # R6: running max of CFE_SB.CommandCounter (a new high = a new command) +
-        # a dwell countdown so a single-step command latches the leaky integrator.
-        self._sb_cmd_max = None
-        self._sb_cmd_dwell = 0
+        # R6/R7: per command-counter running max (a new high = a new command) + a
+        # dwell countdown so a single-step command latches the leaky integrator.
+        self._cmd_max = {i: None for i in self._cmd_rule}
+        self._cmd_dwell = {i: 0 for i in self._cmd_rule}
         self._prev_evs = None
         self._prev_sb = None
         self._prev_cmderr = {h: None for h in self._cmderr_idx}
@@ -348,20 +362,22 @@ class Plugin(AIPlugin):
                 self._monstate_baseline[f] = v   # establish the protective baseline
             elif v != self._monstate_baseline[f]:
                 fired.add(f"R5:{f.split('.')[0]}-monstate")
-        # R6 sb-command: a NEW HIGH of CFE_SB.CommandCounter = a CFE_SB command was
-        # processed (routing/subscription modification). The running max ignores the
-        # double-buffer flicker back to stale values; the dwell holds the fire long
-        # enough for the leaky integrator to latch a bounded incident.
-        v = val(self._sb_cmd_idx)
-        if v is not None:
-            if self._sb_cmd_max is None:
-                self._sb_cmd_max = v            # establish baseline (warmup)
-            elif v > self._sb_cmd_max:
-                self._sb_cmd_max = v
-                self._sb_cmd_dwell = self._sb_cmd_dwell_frames
-        if self._sb_cmd_dwell > 0:
-            fired.add("R6:sb-command")
-            self._sb_cmd_dwell -= 1
+        # R6/R7 command rules: a NEW HIGH of a static `*.CommandCounter` = an attacker
+        # command was processed (R6 CFE_SB → routing/subscription modification; R7
+        # CFE_EVS → event-type suppression / DE-0002.03 inhibit). The running max
+        # ignores the double-buffer flicker back to stale values; the dwell holds the
+        # fire long enough for the leaky integrator to latch one bounded incident.
+        for i, rid in self._cmd_rule.items():
+            v = val(i)
+            if v is not None:
+                if self._cmd_max[i] is None:
+                    self._cmd_max[i] = v          # establish baseline (warmup)
+                elif v > self._cmd_max[i]:
+                    self._cmd_max[i] = v
+                    self._cmd_dwell[i] = self._cmd_dwell_frames
+            if self._cmd_dwell[i] > 0:
+                fired.add(rid)
+                self._cmd_dwell[i] -= 1
 
         # ── Leaky-integrator hysteresis + edge-triggered alert/clear ────────
         edge = []
