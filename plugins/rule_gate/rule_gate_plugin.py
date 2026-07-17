@@ -51,6 +51,12 @@ the IF's high_level_data) and fires on:
                       nominal (nothing loads tables in steady state). Same mechanism as
                       R6/R7/R8; the running-max survives the attacker's evidence-hiding
                       CFE_TBL_RESET (the new high is latched before the reset zeroes it).
+  R10 bus-sweep     : META-rule — >= BusSweepMinRules (default 3) DISTINCT command rules
+                      (R6-R9) fire in the same window. A single technique trips one
+                      command counter; a flat-bus SWEEP (LM-0002) trips many at once.
+                      Priced above the individual command rules so the incident labels
+                      LM-0002 instead of collapsing to whichever single rule (usually
+                      R2 evs-flood) outlasts the others.
 
 The rule that fires IS the label (R1:NOVATEL → GPS disable, etc.), so no XGBoost
 classifier is needed for this class. The two gates are complementary: the IF owns
@@ -99,6 +105,7 @@ _TECH_LABEL = {
     "R7:evs-command": "CFE_EVS command — event-type suppression / inhibit (DE-0002.03)",
     "R8:es-command": "CFE_ES command — C&DH on-board value modification (EX-0012.10)",
     "R9:tbl-command": "CFE_TBL command — table load/activate persistence (PER-0001)",
+    "R10:bus-sweep": "Bus sweep — many MIDs commanded in one window (LM-0002 lack of bus segregation)",
 }
 
 
@@ -131,12 +138,14 @@ def _monstate_label(rule_id: str) -> str:
 def _incident_label(active_rules):
     """(cluster, sub_technique) for the primary active rule — the incident label.
 
-    Priority device-disable > monitor-state > sb/evs-command > evs-flood > cmd-error
-    > sb-error, so a DE-0010 flood (which fires R2+R3) labels as DE-0010, a sensor
-    disable as its technique, and an LC/HS monitoring-disable as EX-0011.
+    Priority device-disable > bus-sweep > monitor-state > sb/evs/es/tbl-command >
+    evs-flood > cmd-error > sb-error, so a DE-0010 flood (R2+R3) labels DE-0010, a
+    sensor disable as its technique, an LC/HS monitoring-disable as EX-0011, and a
+    multi-command sweep as LM-0002 (rather than collapsing to its loudest single rule).
     """
     def _prio(r):
-        return {"R1": 0, "R5": 1, "R6": 2, "R7": 2, "R8": 2, "R9": 2, "R2": 3, "R4": 4, "R3": 5}.get(r.split(":", 1)[0], 6)
+        return {"R1": 0, "R10": 1, "R5": 2, "R6": 3, "R7": 3, "R8": 3, "R9": 3,
+                "R2": 4, "R4": 5, "R3": 6}.get(r.split(":", 1)[0], 7)
     if not active_rules:
         return "", ""
     r = min(active_rules, key=_prio)
@@ -146,6 +155,8 @@ def _incident_label(active_rules):
                    else "EX-0014.03" if comp in ("IMU", "MAG", "CSS", "FSS", "ST")
                    else "DE-0002.03")
         return cluster, f"{comp}-disabled"
+    if r == "R10:bus-sweep":
+        return "LM-0002", "bus-sweep"
     if r.startswith("R5:"):
         app = r.split(":", 1)[1].rsplit("-", 1)[0]
         return "EX-0011", f"{app}-monitoring-disabled"
@@ -196,6 +207,12 @@ class Plugin(AIPlugin):
         # DE-0002.03 inhibit). A command is a single new-high step, so we hold the fire
         # for CmdDwell frames to let the leaky integrator latch one bounded incident.
         "CmdDwell": "8",
+        # R10 bus-sweep meta-rule: LM-0002 sweeps every reachable MID, tripping several
+        # static-in-nominal command counters (R6/R7/R8/R9) in the same short window. No
+        # single technique does that, so when this many DISTINCT command rules are firing
+        # together, label it a bus sweep (LM-0002) rather than letting it collapse to
+        # whichever single rule (usually R2 evs-flood) outlasts the others.
+        "BusSweepMinRules": "3",
         "HeartbeatEvery": "1000",
         # Incident aggregation (NOS3-201). The rule-gate's leaky integrator
         # already smoothed flicker, so the incident layer's own hysteresis is
@@ -238,6 +255,7 @@ class Plugin(AIPlugin):
         # Services), so any new high is an attacker command. col index → rule-id
         # (present fields only).
         self._cmd_dwell_frames = _int("CmdDwell")
+        self._bus_sweep_min = _int("BusSweepMinRules")
         self._cmd_rule = {}
         for field, rid in (("CFE_SB.CommandCounter", "R6:sb-command"),
                            ("CFE_EVS_HK.CommandCounter", "R7:evs-command"),
@@ -266,6 +284,10 @@ class Plugin(AIPlugin):
             self._rule_ids.add(f"R5:{f.split('.')[0]}-monstate")
         for rid in self._cmd_rule.values():
             self._rule_ids.add(rid)
+        # R10 bus-sweep meta-rule can only fire if enough command counters exist to
+        # cross the threshold; register it only then.
+        if len(self._cmd_rule) >= self._bus_sweep_min:
+            self._rule_ids.add("R10:bus-sweep")
 
         self._activity = {r: 0.0 for r in self._rule_ids}
         self._rule_active = {r: False for r in self._rule_ids}
@@ -399,6 +421,14 @@ class Plugin(AIPlugin):
             if self._cmd_dwell[i] > 0:
                 fired.add(rid)
                 self._cmd_dwell[i] -= 1
+
+        # R10 bus-sweep (LM-0002): several distinct static-in-nominal command counters
+        # tripped in the same window. The individual command dwells overlap during a
+        # sweep, so counting the distinct command rules firing THIS frame catches it.
+        if "R10:bus-sweep" in self._rule_ids:
+            n_cmd = sum(1 for rid in self._cmd_rule.values() if rid in fired)
+            if n_cmd >= self._bus_sweep_min:
+                fired.add("R10:bus-sweep")
 
         # ── Leaky-integrator hysteresis + edge-triggered alert/clear ────────
         edge = []

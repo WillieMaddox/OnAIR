@@ -378,3 +378,57 @@ def test_r9_emits_per0001_incident():
         _feed_tb(p, 1)
     assert closed, "a tbl-command incident should open then close"
     assert closed[0].cluster == "PER-0001" and "tbl-command" in closed[0].sub_technique
+
+
+# R10 bus-sweep: LM-0002 sweeps every MID, tripping several static-in-nominal command
+# counters at once. The header carries all four (CFE_SB/EVS/ES/TBL) so >=3 firing
+# together crosses BusSweepMinRules and labels LM-0002 instead of collapsing to R2.
+HSW = ["IMU.DeviceEnabled", "CFE_EVS_HK.MessageSendCounter",
+       "CFE_SB.MsgSendErrorCounter", "ADCS_HK.CommandErrorCount",
+       "CFE_SB.CommandCounter", "CFE_EVS_HK.CommandCounter",
+       "CFE_ES.CommandCounter", "CFE_TBL.CommandCounter", "ADCS_GNC.Mode"]
+
+
+def _feed_sw(p, sb, evs, es, tbl, mode="2"):
+    _feed(p, HSW, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": "131",
+                   "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0",
+                   "CFE_SB.CommandCounter": str(sb), "CFE_EVS_HK.CommandCounter": str(evs),
+                   "CFE_ES.CommandCounter": str(es), "CFE_TBL.CommandCounter": str(tbl),
+                   "ADCS_GNC.Mode": mode})
+
+
+def _warmup_sw(p):
+    for _ in range(31):
+        _feed_sw(p, 0, 0, 0, 0)
+
+
+def test_r10_bus_sweep_latches():
+    p = _mk(HSW)
+    _warmup_sw(p)
+    _feed_sw(p, 1, 1, 1, 1)                      # 4 command counters tick together = sweep
+    for _ in range(4):
+        _feed_sw(p, 1, 1, 1, 1)
+    assert "R10:bus-sweep" in p._latest_active
+
+
+def test_r10_single_command_does_not_fire():
+    p = _mk(HSW)
+    _warmup_sw(p)
+    _feed_sw(p, 1, 0, 0, 0)                      # only CFE_SB moved (a single technique)
+    for _ in range(4):
+        _feed_sw(p, 1, 0, 0, 0)
+    assert "R6:sb-command" in p._latest_active   # the single command rule still fires
+    assert "R10:bus-sweep" not in p._latest_active
+
+
+def test_r10_emits_lm0002_incident_over_command_rules():
+    p = _mk(HSW)
+    _warmup_sw(p)
+    closed = []
+    p._write_incident = lambda inc: closed.append(inc)
+    _feed_sw(p, 1, 1, 1, 1)                      # sweep -> R6+R7+R8+R9+R10
+    for _ in range(28):
+        _feed_sw(p, 1, 1, 1, 1)
+    assert closed, "a bus-sweep incident should open then close"
+    # R10 outranks the individual command rules -> labeled LM-0002, not a single rule
+    assert closed[0].cluster == "LM-0002" and "bus-sweep" in closed[0].sub_technique
