@@ -57,6 +57,30 @@ the IF's high_level_data) and fires on:
                       Priced above the individual command rules so the incident labels
                       LM-0002 instead of collapsing to whichever single rule (usually
                       R2 evs-flood) outlasts the others.
+  R11 fm-command    : FM.CommandCounter reaches a new high — a File Manager command
+                      (COPY/MOVE/DELETE/DELETE_ALL). Static in nominal ops (nothing
+                      routinely commands the filesystem in steady state; validated
+                      2026-07-29 live: static at 0/1 while DS.FileWriteCounter climbs
+                      continuously — DS is NOT usable, FM is). A burst of FM file ops is
+                      the on-board footprint of a wiper (EX-0010.02 mass DELETE_ALL) or
+                      ransomware (EX-0010.01 COPY->.enc + DELETE churn); the two are
+                      indistinguishable at the HK level, so R11 catches the class and the
+                      command mix disambiguates. Same static-in-nominal new-high + dwell
+                      mechanism as R6-R9. The dynamics-IF is filesystem-blind and the
+                      consistency/staleness gates miss it (the counter goes UP, no stream
+                      freezes, no backward counter), so this rule is the only catch.
+  R12 to-command    : TO.usCmdCnt reaches a new high — a command to the full Telemetry
+                      Output app (TO_ENABLE_OUTPUT redirects the downlink to an attacker
+                      = EXF-0003.02 downlink exfiltration). Static in nominal (the GSW
+                      enables the downlink once at connect, then leaves it). Same
+                      static-in-nominal new-high + dwell mechanism as R6-R11.
+  R13 to-route      : TO.usEnabledRoutes / TO.usConfigRoutes (the downlink route masks)
+                      leave their nominal baseline — the downlink routing/destination was
+                      reconfigured (EXF-0003.02 exfil / IMP-0006 theft). A specific
+                      corroborator of R12: fires on a route enable/disable/add; a
+                      same-destination redirect that leaves the mask unchanged is still
+                      caught by R12's command-counter increment. Baseline-deviation +
+                      leaky-integrator flicker tolerance, same as R5 monitor-state.
 
 The rule that fires IS the label (R1:NOVATEL → GPS disable, etc.), so no XGBoost
 classifier is needed for this class. The two gates are complementary: the IF owns
@@ -106,6 +130,9 @@ _TECH_LABEL = {
     "R8:es-command": "CFE_ES command — C&DH on-board value modification (EX-0012.10)",
     "R9:tbl-command": "CFE_TBL command — table load/activate persistence (PER-0001)",
     "R10:bus-sweep": "Bus sweep — many MIDs commanded in one window (LM-0002 lack of bus segregation)",
+    "R11:fm-command": "File Manager command — file-operation burst (EX-0010.01 ransomware / EX-0010.02 wiper)",
+    "R12:to-command": "Telemetry Output command — downlink reconfigure (EXF-0003.02 downlink exfiltration)",
+    "R13:to-route": "Downlink route mask changed — downlink reconfigured (EXF-0003.02 exfil / IMP-0006 theft)",
 }
 
 
@@ -138,14 +165,16 @@ def _monstate_label(rule_id: str) -> str:
 def _incident_label(active_rules):
     """(cluster, sub_technique) for the primary active rule — the incident label.
 
-    Priority device-disable > bus-sweep > monitor-state > sb/evs/es/tbl-command >
-    evs-flood > cmd-error > sb-error, so a DE-0010 flood (R2+R3) labels DE-0010, a
+    Priority device-disable > bus-sweep > monitor-state/route-state >
+    sb/evs/es/tbl/fm/to-command > evs-flood > cmd-error > sb-error, so a DE-0010 flood
+    (R2+R3) labels DE-0010, a downlink route change (R12+R13) labels EXF-0003.02/to-route, a
     sensor disable as its technique, an LC/HS monitoring-disable as EX-0011, and a
     multi-command sweep as LM-0002 (rather than collapsing to its loudest single rule).
     """
     def _prio(r):
-        return {"R1": 0, "R10": 1, "R5": 2, "R6": 3, "R7": 3, "R8": 3, "R9": 3,
-                "R2": 4, "R4": 5, "R3": 6}.get(r.split(":", 1)[0], 7)
+        return {"R1": 0, "R10": 1, "R5": 2, "R13": 2, "R6": 3, "R7": 3, "R8": 3,
+                "R9": 3, "R11": 3, "R12": 3, "R2": 4, "R4": 5, "R3": 6}.get(
+                    r.split(":", 1)[0], 7)
     if not active_rules:
         return "", ""
     r = min(active_rules, key=_prio)
@@ -168,6 +197,12 @@ def _incident_label(active_rules):
         return "EX-0012.10", "es-command"
     if r == "R9:tbl-command":
         return "PER-0001", "tbl-command"
+    if r == "R11:fm-command":
+        return "EX-0010", "fm-command"
+    if r == "R12:to-command":
+        return "EXF-0003.02", "to-command"
+    if r == "R13:to-route":
+        return "EXF-0003.02", "to-route"
     if r == "R2:evs":
         return "DE-0010", "evs-flood"
     if r == "R3:sb":
@@ -200,6 +235,10 @@ class Plugin(AIPlugin):
         # their protective session baseline is an alert (monitoring/limit-check
         # turned off). LC.CurrentLCState: 1=ACTIVE(protective) 2=PASSIVE 3=DISABLED.
         "MonitorStateFields": "LC.CurrentLCState",
+        # R13 route-state: comma-separated telemetry fields whose deviation from their
+        # nominal session baseline means the downlink was reconfigured (EXF-0003.02).
+        # The full TO app's route masks are static in nominal; a change = exfil signal.
+        "RouteStateFields": "TO.usEnabledRoutes,TO.usConfigRoutes",
         # R6/R7 command rules: CFE_SB.CommandCounter and CFE_EVS_HK.CommandCounter are
         # STATIC in nominal ops (nothing routinely commands the Software Bus or Event
         # Services), so any increment = an attacker command — R6 CFE_SB
@@ -250,17 +289,21 @@ class Plugin(AIPlugin):
         self._evs_idx = idx.get("CFE_EVS_HK.MessageSendCounter")
         self._sb_idx = idx.get("CFE_SB.MsgSendErrorCounter")
         self._mode_idx = idx.get("ADCS_GNC.Mode")
-        # R6/R7/R8 command rules: a `*.CommandCounter` that is STATIC in nominal ops
-        # (nothing routinely commands the Software Bus / Event Services / Executive
-        # Services), so any new high is an attacker command. col index → rule-id
-        # (present fields only).
+        # R6/R7/R8/R9/R11/R12 command rules: a `*.CommandCounter` (or TO.usCmdCnt) that
+        # is STATIC in nominal ops (nothing routinely commands the Software Bus / Event
+        # Services / Executive Services / Table Services / File Manager / Telemetry
+        # Output), so any new high is an attacker command. col index → rule-id (present
+        # fields only). FM.CommandCounter is the wiper/ransomware (EX-0010) file-op-burst
+        # signal (R11); TO.usCmdCnt is the downlink-exfil (EXF-0003.02) signal (R12).
         self._cmd_dwell_frames = _int("CmdDwell")
         self._bus_sweep_min = _int("BusSweepMinRules")
         self._cmd_rule = {}
         for field, rid in (("CFE_SB.CommandCounter", "R6:sb-command"),
                            ("CFE_EVS_HK.CommandCounter", "R7:evs-command"),
                            ("CFE_ES.CommandCounter", "R8:es-command"),
-                           ("CFE_TBL.CommandCounter", "R9:tbl-command")):
+                           ("CFE_TBL.CommandCounter", "R9:tbl-command"),
+                           ("FM.CommandCounter", "R11:fm-command"),
+                           ("TO.usCmdCnt", "R12:to-command")):
             if field in idx:
                 self._cmd_rule[idx[field]] = rid
         # R5 monitor-state fields present in this schema, name → column index.
@@ -268,6 +311,16 @@ class Plugin(AIPlugin):
         self._monstate_idx = {f.strip(): idx[f.strip()]
                               for f in monstate_cfg.split(",")
                               if f.strip() and f.strip() in idx}
+        # R13 route-state (EXF-0003.02 corroborator): the full TO app's downlink
+        # route masks (TO.usEnabledRoutes / TO.usConfigRoutes) are STATIC in nominal;
+        # a change means the downlink routing/destination was reconfigured — the
+        # specific downlink-exfil signal that complements R12's command counter.
+        # (Fires on an enable/disable/add-route; a same-destination redirect that
+        # leaves the mask unchanged is still caught by R12's usCmdCnt increment.)
+        route_cfg = cfg.get("routestatefields", self.DEFAULTS["RouteStateFields"])
+        self._routestate_idx = {f.strip(): idx[f.strip()]
+                                for f in route_cfg.split(",")
+                                if f.strip() and f.strip() in idx}
 
         # The full set of rule-ids that can ever fire (so the leaky counter
         # decays even on frames a rule is quiet).
@@ -284,6 +337,8 @@ class Plugin(AIPlugin):
             self._rule_ids.add(f"R5:{f.split('.')[0]}-monstate")
         for rid in self._cmd_rule.values():
             self._rule_ids.add(rid)
+        if self._routestate_idx:
+            self._rule_ids.add("R13:to-route")
         # R10 bus-sweep meta-rule can only fire if enough command counters exist to
         # cross the threshold; register it only then.
         if len(self._cmd_rule) >= self._bus_sweep_min:
@@ -295,6 +350,9 @@ class Plugin(AIPlugin):
         # R5 baseline = the protective state established during warmup (first seen,
         # e.g. LC ACTIVE=1). None until a real value arrives; a later deviation fires.
         self._monstate_baseline = {f: None for f in self._monstate_idx}
+        # R13 route-state baseline = the downlink route mask at warmup (static in
+        # nominal). None until a real value arrives; a later deviation fires.
+        self._routestate_baseline = {f: None for f in self._routestate_idx}
         # R6/R7: per command-counter running max (a new high = a new command) + a
         # dwell countdown so a single-step command latches the leaky integrator.
         self._cmd_max = {i: None for i in self._cmd_rule}
@@ -331,8 +389,11 @@ class Plugin(AIPlugin):
 
         print(f"[rule_gate] watching {len(self._enable_idx)} DeviceEnabled flags, "
               f"{len(self._cmderr_idx)} cmd-err counters, "
+              f"{len(self._cmd_rule)} static-cmd counters, "
               f"{len(self._monstate_idx)} monitor-state fields "
               f"({', '.join(self._monstate_idx) or 'none'}), "
+              f"{len(self._routestate_idx)} route-state fields "
+              f"({', '.join(self._routestate_idx) or 'none'}), "
               f"EVS={'y' if self._evs_idx is not None else 'n'} "
               f"SB={'y' if self._sb_idx is not None else 'n'}; "
               f"warmup={self._warmup_frames}, leaky "
@@ -405,6 +466,18 @@ class Plugin(AIPlugin):
                 self._monstate_baseline[f] = v   # establish the protective baseline
             elif v != self._monstate_baseline[f]:
                 fired.add(f"R5:{f.split('.')[0]}-monstate")
+        # R13 route-state: the full TO app's downlink route mask left its nominal
+        # baseline — the downlink was reconfigured (route enabled/disabled/added). A
+        # specific downlink-exfil signal (EXF-0003.02) that corroborates R12. Same
+        # baseline-deviation + leaky-integrator flicker tolerance as R5.
+        for f, i in self._routestate_idx.items():
+            v = val(i)
+            if v is None:
+                continue
+            if self._routestate_baseline[f] is None:
+                self._routestate_baseline[f] = v
+            elif v != self._routestate_baseline[f]:
+                fired.add("R13:to-route")
         # R6/R7 command rules: a NEW HIGH of a static `*.CommandCounter` = an attacker
         # command was processed (R6 CFE_SB → routing/subscription modification; R7
         # CFE_EVS → event-type suppression / DE-0002.03 inhibit). The running max

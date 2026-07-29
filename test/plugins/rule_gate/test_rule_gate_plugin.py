@@ -432,3 +432,174 @@ def test_r10_emits_lm0002_incident_over_command_rules():
     assert closed, "a bus-sweep incident should open then close"
     # R10 outranks the individual command rules -> labeled LM-0002, not a single rule
     assert closed[0].cluster == "LM-0002" and "bus-sweep" in closed[0].sub_technique
+
+
+# R11 fm-command: header includes FM.CommandCounter (static in nominal — validated
+# live 2026-07-29 static at 0/1). A burst of FM file ops is the wiper (EX-0010.02
+# DELETE_ALL) / ransomware (EX-0010.01 COPY->.enc + DELETE) footprint the dynamics-IF
+# and the consistency/staleness gates all miss.
+HFM = ["IMU.DeviceEnabled", "CFE_EVS_HK.MessageSendCounter",
+       "CFE_SB.MsgSendErrorCounter", "ADCS_HK.CommandErrorCount",
+       "FM.CommandCounter", "ADCS_GNC.Mode"]
+
+
+def _feed_fm(p, cc, mode="2"):
+    _feed(p, HFM, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": "131",
+                   "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0",
+                   "FM.CommandCounter": str(cc), "ADCS_GNC.Mode": mode})
+
+
+def _warmup_fm(p, cc=0):
+    for _ in range(31):
+        _feed_fm(p, cc)
+
+
+def test_r11_fm_command_latches():
+    p = _mk(HFM)
+    _warmup_fm(p, cc=1)                          # baseline FM CommandCounter = 1 (post-NOOP)
+    _feed_fm(p, 24)                             # a wiper burst: 1->24 new high
+    for _ in range(4):
+        _feed_fm(p, 24)
+    assert "R11:fm-command" in p._latest_active
+
+
+def test_r11_static_never_fires():
+    p = _mk(HFM)
+    _warmup_fm(p, cc=0)
+    for _ in range(20):                          # no FM command -> counter static
+        _feed_fm(p, 0)
+    assert "R11:fm-command" not in p._latest_active
+
+
+def test_r11_double_buffer_flicker_single_burst():
+    # The OnAIR double buffer flickers the fresh value with the stale one; the running
+    # max must ignore the flicker back to the pre-burst value and keep the alert up.
+    p = _mk(HFM)
+    _warmup_fm(p, cc=1)
+    for _ in range(6):
+        _feed_fm(p, 71)                         # fresh buffer: ransomware peak
+        _feed_fm(p, 1)                          # stale buffer flickers back to baseline
+    assert "R11:fm-command" in p._latest_active
+
+
+def test_r11_emits_ex0010_incident():
+    p = _mk(HFM)
+    _warmup_fm(p, cc=0)
+    closed = []
+    p._write_incident = lambda inc: closed.append(inc)
+    _feed_fm(p, 23)                             # file-op burst -> dwell -> latch
+    for _ in range(28):                          # static; dwell ends -> decays -> clears
+        _feed_fm(p, 23)
+    assert closed, "an fm-command incident should open then close"
+    assert closed[0].cluster == "EX-0010" and "fm-command" in closed[0].sub_technique
+
+
+# R12 to-command: header includes TO.usCmdCnt (the full TO app's command counter,
+# static in nominal — validated live 2026-07-29 static at 0). A command to the full
+# TO app (TO_ENABLE_OUTPUT redirects the downlink) is the EXF-0003.02 downlink-exfil
+# signal the dynamics-IF and the other gates miss.
+HTO = ["IMU.DeviceEnabled", "CFE_EVS_HK.MessageSendCounter",
+       "CFE_SB.MsgSendErrorCounter", "ADCS_HK.CommandErrorCount",
+       "TO.usCmdCnt", "ADCS_GNC.Mode"]
+
+
+def _feed_to(p, cc, mode="2"):
+    _feed(p, HTO, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": "131",
+                   "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0",
+                   "TO.usCmdCnt": str(cc), "ADCS_GNC.Mode": mode})
+
+
+def _warmup_to(p, cc=0):
+    for _ in range(31):
+        _feed_to(p, cc)
+
+
+def test_r12_to_command_latches():
+    p = _mk(HTO)
+    _warmup_to(p, cc=0)                          # baseline TO.usCmdCnt = 0 (nominal)
+    _feed_to(p, 1)                              # a TO command: 0->1 new high
+    for _ in range(4):
+        _feed_to(p, 1)
+    assert "R12:to-command" in p._latest_active
+
+
+def test_r12_static_never_fires():
+    p = _mk(HTO)
+    _warmup_to(p, cc=0)
+    for _ in range(20):                          # no TO command -> counter static
+        _feed_to(p, 0)
+    assert "R12:to-command" not in p._latest_active
+
+
+def test_r12_emits_exf0003_02_incident():
+    p = _mk(HTO)
+    _warmup_to(p, cc=0)
+    closed = []
+    p._write_incident = lambda inc: closed.append(inc)
+    _feed_to(p, 1)                              # ENABLE_OUTPUT redirect -> dwell -> latch
+    for _ in range(28):
+        _feed_to(p, 1)
+    assert closed, "a to-command incident should open then close"
+    assert closed[0].cluster == "EXF-0003.02" and "to-command" in closed[0].sub_technique
+
+
+# R13 to-route: header includes the full TO app's downlink route masks. A change from
+# the nominal baseline means the downlink was reconfigured (route enabled/disabled) —
+# the specific EXF-0003.02 exfil corroborator of R12.
+HRT = ["IMU.DeviceEnabled", "CFE_EVS_HK.MessageSendCounter",
+       "CFE_SB.MsgSendErrorCounter", "ADCS_HK.CommandErrorCount",
+       "TO.usEnabledRoutes", "TO.usConfigRoutes", "ADCS_GNC.Mode"]
+
+
+def _feed_rt(p, enabled, config, mode="2"):
+    _feed(p, HRT, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": "131",
+                   "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0",
+                   "TO.usEnabledRoutes": str(enabled), "TO.usConfigRoutes": str(config),
+                   "ADCS_GNC.Mode": mode})
+
+
+def _warmup_rt(p, enabled=0, config=0):
+    for _ in range(31):
+        _feed_rt(p, enabled, config)
+
+
+def test_r13_route_change_latches():
+    p = _mk(HRT)
+    _warmup_rt(p, enabled=0, config=0)          # baseline: downlink routes off
+    _feed_rt(p, 1, 1)                           # ENABLE_OUTPUT turns a route on: 0->1
+    for _ in range(4):
+        _feed_rt(p, 1, 1)
+    assert "R13:to-route" in p._latest_active
+
+
+def test_r13_static_never_fires():
+    p = _mk(HRT)
+    _warmup_rt(p, enabled=1, config=1)          # baseline: downlink already enabled
+    for _ in range(20):                          # unchanged -> no fire
+        _feed_rt(p, 1, 1)
+    assert "R13:to-route" not in p._latest_active
+
+
+def test_r13_tolerates_double_buffer_flicker():
+    # usEnabledRoutes flickers fresh(1) / stale(0) after the change; the leaky
+    # integrator must keep the alert up despite the every-other-frame flicker.
+    p = _mk(HRT)
+    _warmup_rt(p, enabled=0, config=0)
+    for _ in range(6):
+        _feed_rt(p, 1, 1)                       # fresh buffer: route enabled
+        _feed_rt(p, 0, 0)                       # stale buffer flickers to baseline
+    assert "R13:to-route" in p._latest_active
+
+
+def test_r13_emits_exf0003_02_incident():
+    p = _mk(HRT)
+    _warmup_rt(p, enabled=0, config=0)
+    closed = []
+    p._write_incident = lambda inc: closed.append(inc)
+    _feed_rt(p, 1, 1)
+    for _ in range(6):
+        _feed_rt(p, 1, 1)
+    for _ in range(28):                          # route returns to baseline -> clears
+        _feed_rt(p, 0, 0)
+    assert closed, "a to-route incident should open then close"
+    assert closed[0].cluster == "EXF-0003.02" and "to-route" in closed[0].sub_technique
