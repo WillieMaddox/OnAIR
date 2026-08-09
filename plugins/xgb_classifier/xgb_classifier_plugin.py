@@ -172,6 +172,21 @@ class Plugin(AIPlugin):
         self.schema = cls_art["schema"]
         self.include_deltas = cls_art.get("config", {}).get("include_deltas", True)
 
+        # ─── AINOS3-37: selective per-mode hybrid ────────────────────────
+        # A hybrid artifact adds per-mode heads for the signal-rich dynamic
+        # modes (INERTIAL/SUNSAFE) plus a per-mode confidence calibration; the
+        # global `clf` still serves PASSIVE/BDOT and any unseen mode. These
+        # keys are ABSENT in the plain v3 artifact, so an unchanged v3 pickle
+        # falls straight through to the single-head path (zero behaviour
+        # change). Each head is scored via its OWN `.classes_` — a per-mode
+        # head carries only the subset of attack classes seen in that mode, so
+        # indexing by the global label list would be wrong.
+        self.mode_heads: dict[str, Any] = dict(cls_art.get("mode_heads") or {})
+        self.route_modes: set[str] = set(cls_art.get("route_modes") or [])
+        # {mode: {"x": [...], "y": [...]}} isotonic top1-prob → reliability,
+        # applied with np.interp (no sklearn dependency at runtime).
+        self.calibration: dict[str, dict] = cls_art.get("calibration") or {}
+
         # Load classifier calibration (top_k, min_confidence)
         self.top_k = int(cfg.get("topk", self.DEFAULTS["TopK"]))
         self.min_confidence = float(cfg.get("minconfidence", self.DEFAULTS["MinConfidence"]))
@@ -352,6 +367,13 @@ class Plugin(AIPlugin):
 
         print(f"[xgb_cls] classifier loaded: {len(self.labels)} classes, "
               f"top_k={self.top_k}, min_confidence={self.min_confidence:.2f}")
+        if self.mode_heads:
+            print(f"[xgb_cls] selective per-mode hybrid (AINOS3-37): "
+                  f"{len(self.mode_heads)} per-mode head(s) for "
+                  f"{sorted(self.route_modes)}; global head for all other modes; "
+                  f"{len(self.calibration)} calibrated mode(s)")
+        else:
+            print("[xgb_cls] single global head (no per-mode routing)")
         print(f"[xgb_cls] IF-gating against {os.path.basename(self.if_path)} "
               f"({len(self.if_models)} per-mode IFs)")
         print(f"[xgb_cls] feature schema: n_raw={self.n_raw}, "
@@ -425,6 +447,25 @@ class Plugin(AIPlugin):
         key = str(raw_value).strip()
         return self._routing_map.get(key, self.fallback_mode)
 
+    def _active_head(self, mode: str):
+        """AINOS3-37: the head that scores this frame — the per-mode head for a
+        routed mode (selective hybrid), else the global head. Returns
+        (head, classes_) so the caller labels predictions by the head's OWN
+        class list (a per-mode head carries only its mode's subset)."""
+        if mode in self.route_modes and mode in self.mode_heads:
+            h = self.mode_heads[mode]
+            return h, h.classes_
+        return self.clf, self.clf.classes_
+
+    def _calibrate_conf(self, mode: str, prob: float) -> float:
+        """Map a raw top-1 probability to its per-mode calibrated reliability
+        (monotone isotonic via np.interp), so a confidence means the same thing
+        whichever head produced it. Identity when the mode isn't calibrated."""
+        c = self.calibration.get(mode)
+        if not c or not c.get("x"):
+            return prob
+        return float(np.interp(prob, c["x"], c["y"]))
+
     def _gate_via_if(self, features: np.ndarray, mode: str) -> tuple[bool, float]:
         """Return (is_anomaly, score) using the per-mode IF model for the
         active ADCS mode. If the mode isn't in the pickle (shouldn't
@@ -492,11 +533,16 @@ class Plugin(AIPlugin):
                 self._side_file_append_skip(if_score, mode)
             return
 
-        # IF flagged → run classifier
-        probs = self.clf.predict_proba(features.reshape(1, -1))[0]
+        # IF flagged → run classifier. AINOS3-37: route to the per-mode head for
+        # a routed mode, else the global head; label by that head's own classes_.
+        head, classes = self._active_head(mode)
+        probs = head.predict_proba(features.reshape(1, -1))[0]
         order = np.argsort(probs)[::-1]
-        top = [(self.labels[i], float(probs[i])) for i in order[:self.top_k]]
-        top1_class, top1_prob = top[0]
+        top = [(str(classes[i]), float(probs[i])) for i in order[:self.top_k]]
+        top1_class, top1_prob_raw = top[0]
+        # AINOS3-37: per-mode calibration so the confidence is comparable across
+        # heads. Monotone → argmax (top1_class) unchanged; only the number moves.
+        top1_prob = self._calibrate_conf(mode, top1_prob_raw)
         # NOS3-202: collapse telemetry-indistinguishable sub-techniques.
         predicted_cluster = self._cluster_map.get(top1_class, top1_class)
         # Below-confidence override: emit "unknown" but keep the top probs

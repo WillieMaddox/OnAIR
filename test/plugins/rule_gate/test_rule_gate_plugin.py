@@ -121,6 +121,26 @@ def test_monstate_label_maps_ex0011():
     assert "EX-0011" in _monstate_label("R5:LC-monstate")
 
 
+def test_monstate_label_names_de0001_family():
+    # AINOS3-73: DE-0001 (disable fault management) shares the LC-disable
+    # footprint with EX-0011 / DE-0005 (all drive LC.CurrentLCState 1->3), so
+    # R5's label names the whole fault-management/safe-mode family.
+    from plugins.rule_gate.rule_gate_plugin import _monstate_label
+    label = _monstate_label("R5:LC-monstate")
+    assert "DE-0001" in label and "DE-0005" in label
+
+
+def test_r5_catches_de0001_lc_disable():
+    # DE-0001's on-board footprint is LC.CurrentLCState leaving its ACTIVE
+    # baseline for DISABLED(3) — the same signal EX-0011/DE-0005 produce. R5
+    # latches on it regardless of which SPARTA technique drove the disable.
+    p = _mk(HM)
+    _warmup_m(p)                         # LC baseline = ACTIVE(1)
+    for _ in range(6):                   # DE-0001 SET_LC_STATE -> DISABLED(3)
+        _feed_m(p, "3")
+    assert any("LC-monstate" in r for r in p._latest_active)
+
+
 def test_r5_monitor_state_disable_latches_and_clears():
     p = _mk(HM)
     _warmup_m(p)                         # LC baseline = ACTIVE(1)

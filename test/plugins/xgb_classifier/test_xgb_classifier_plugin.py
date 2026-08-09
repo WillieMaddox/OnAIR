@@ -30,10 +30,16 @@ class _FakeIF:
 
 
 class _FakeClassifier:
-    """Picklable classifier stub returning fixed probabilities per row."""
-    def __init__(self, probs: list[float], n_features: int = 4):
+    """Picklable classifier stub returning fixed probabilities per row.
+
+    Exposes `classes_` (like a real sklearn estimator) so the plugin labels
+    predictions by the head's own class list — the same order as `probs`."""
+    def __init__(self, probs: list[float], n_features: int = 4, classes=None):
         self.probs = np.asarray(probs, dtype=float)
         self.n_features = n_features
+        self.classes_ = np.asarray(
+            classes if classes is not None
+            else [f"c{i}" for i in range(len(self.probs))])
     def predict_proba(self, X):
         return np.tile(self.probs, (len(X), 1))
 
@@ -41,12 +47,17 @@ class _FakeClassifier:
 def _build_artifacts(tmp_path, *, classifier_probs, if_score: float,
                      if_threshold: float, scalar_cols, labels,
                      delta_only_cols=None, fallback_score: float | None = None,
-                     cal_top_k: int = 3, cal_min_confidence: float = 0.30):
-    """Pickle a (classifier, if) pair + matching calibration JSONs."""
+                     cal_top_k: int = 3, cal_min_confidence: float = 0.30,
+                     mode_heads=None, route_modes=None, calibration=None):
+    """Pickle a (classifier, if) pair + matching calibration JSONs.
+
+    `mode_heads` (a {mode: (probs, classes)} dict), `route_modes`, and
+    `calibration` add the AINOS3-37 hybrid keys; omitted → a plain v3 artifact."""
     # Classifier pickle
     cls_pkl = tmp_path / "cls.pkl"
     cls_art = {
-        "clf": _FakeClassifier(classifier_probs, n_features=len(scalar_cols)),
+        "clf": _FakeClassifier(classifier_probs, n_features=len(scalar_cols),
+                               classes=labels),
         "labels": list(labels),
         "label_to_id": {l: i for i, l in enumerate(labels)},
         "schema": {
@@ -57,6 +68,12 @@ def _build_artifacts(tmp_path, *, classifier_probs, if_score: float,
         },
         "config": {"include_deltas": True},
     }
+    if mode_heads is not None:
+        cls_art["mode_heads"] = {
+            m: _FakeClassifier(probs, n_features=len(scalar_cols), classes=cls)
+            for m, (probs, cls) in mode_heads.items()}
+        cls_art["route_modes"] = list(route_modes or mode_heads.keys())
+        cls_art["calibration"] = calibration or {}
     with open(cls_pkl, "wb") as f:
         pickle.dump(cls_art, f)
     cls_cal = tmp_path / "cls.calibration.json"
@@ -104,7 +121,8 @@ def configured(tmp_path, monkeypatch):
                headers: list[str] | None = None,
                warmup_frames: int = 0, top_k: int = 3,
                min_confidence: float = 0.30, write_side: str = "true",
-               flush_every: int = 1):
+               flush_every: int = 1, mode_heads=None, route_modes=None,
+               calibration=None):
         scalar_cols = ["foo", "bar"]
         # Routing source header lives outside the schema (it's a mode flag).
         if headers is None:
@@ -116,7 +134,8 @@ def configured(tmp_path, monkeypatch):
         cls_pkl, cls_cal, if_pkl, if_cal = _build_artifacts(
             tmp_path, classifier_probs=classifier_probs, if_score=if_score,
             if_threshold=if_threshold, scalar_cols=scalar_cols, labels=labels,
-            cal_top_k=top_k, cal_min_confidence=min_confidence)
+            cal_top_k=top_k, cal_min_confidence=min_confidence,
+            mode_heads=mode_heads, route_modes=route_modes, calibration=calibration)
         ini = tmp_path / "test.ini"
         ini.write_text(
             "[XGB_CLASSIFIER]\n"
@@ -325,3 +344,80 @@ def test_render_reasoning_before_first_frame_returns_safe_default(configured):
     assert r["is_anomaly"] is False
     assert r["predicted_class"] is None
     assert r["predictions"] == []
+
+
+# ─── AINOS3-37: selective per-mode hybrid ────────────────────────────────
+# labels: global head favors EX-0012.04; the MODE_INERTIAL per-mode head
+# carries only a subset {nominal, EX-0001.01} and favors EX-0001.01.
+_HY_LABELS = ["nominal", "EX-0001.01", "EX-0012.04"]
+_HY_MODE_HEADS = {
+    # (probs, classes) — a real per-mode head sees only its mode's classes.
+    "MODE_INERTIAL": ([0.2, 0.8], ["nominal", "EX-0001.01"]),
+}
+
+
+def test_hybrid_backward_compat_plain_artifact_has_no_routing(configured):
+    """A plain v3 artifact (no hybrid keys) loads with empty routing — the
+    single global head serves every mode, unchanged behaviour."""
+    plugin = configured(if_score=-0.05, if_threshold=0.0)
+    assert plugin.mode_heads == {}
+    assert plugin.route_modes == set()
+    assert plugin.calibration == {}
+
+
+def test_hybrid_routes_dynamic_mode_to_per_mode_head(configured):
+    """A routed mode (INERTIAL, mode=3) is scored by its per-mode head, whose
+    top class (EX-0001.01) differs from the global head's (EX-0012.04)."""
+    plugin = configured(
+        if_score=-0.05, if_threshold=0.0,
+        classifier_probs=[0.10, 0.20, 0.70], labels=_HY_LABELS,
+        mode_heads=_HY_MODE_HEADS, route_modes=["MODE_INERTIAL"])
+    plugin.update(low_level_data=["1.0", "2.0", "3"])   # mode=3 → INERTIAL
+    r = plugin.render_reasoning()
+    assert r["mode"] == "MODE_INERTIAL"
+    assert r["predicted_class"] == "EX-0001.01"          # from the per-mode head
+    assert r["predictions"][0][0] == "EX-0001.01"
+
+
+def test_hybrid_nonrouted_mode_uses_global_head(configured):
+    """A non-routed mode (SUNSAFE, mode=2) keeps the global head — baseline
+    behaviour, so its top class is the global head's EX-0012.04."""
+    plugin = configured(
+        if_score=-0.05, if_threshold=0.0,
+        classifier_probs=[0.10, 0.20, 0.70], labels=_HY_LABELS,
+        mode_heads=_HY_MODE_HEADS, route_modes=["MODE_INERTIAL"])
+    plugin.update(low_level_data=["1.0", "2.0", "2"])   # mode=2 → SUNSAFE
+    r = plugin.render_reasoning()
+    assert r["mode"] == "MODE_SUNSAFE"
+    assert r["predicted_class"] == "EX-0012.04"          # global head
+
+
+def test_hybrid_per_mode_calibration_scales_confidence(configured):
+    """Per-mode calibration is a monotone np.interp map on the top-1 prob: it
+    changes the reported confidence but never the winning class. Map
+    (0→0, 1→0.5) sends the per-mode head's raw 0.8 → 0.4."""
+    plugin = configured(
+        if_score=-0.05, if_threshold=0.0,
+        classifier_probs=[0.10, 0.20, 0.70], labels=_HY_LABELS,
+        mode_heads=_HY_MODE_HEADS, route_modes=["MODE_INERTIAL"],
+        calibration={"MODE_INERTIAL": {"x": [0.0, 1.0], "y": [0.0, 0.5]}},
+        min_confidence=0.30)
+    plugin.update(low_level_data=["1.0", "2.0", "3"])   # INERTIAL, raw top1=0.8
+    r = plugin.render_reasoning()
+    assert r["predicted_class"] == "EX-0001.01"          # argmax unchanged
+    assert r["predicted_confidence"] == pytest.approx(0.40)  # 0.8 → calibrated 0.4
+
+
+def test_hybrid_calibration_below_min_confidence_emits_unknown(configured):
+    """If calibration pushes the top-1 confidence under min_confidence, the
+    class is reported 'unknown' (the gate uses the calibrated number)."""
+    plugin = configured(
+        if_score=-0.05, if_threshold=0.0,
+        classifier_probs=[0.10, 0.20, 0.70], labels=_HY_LABELS,
+        mode_heads=_HY_MODE_HEADS, route_modes=["MODE_INERTIAL"],
+        calibration={"MODE_INERTIAL": {"x": [0.0, 1.0], "y": [0.0, 0.25]}},
+        min_confidence=0.30)
+    plugin.update(low_level_data=["1.0", "2.0", "3"])   # raw 0.8 → calibrated 0.2
+    r = plugin.render_reasoning()
+    assert r["predicted_confidence"] == pytest.approx(0.20)
+    assert r["predicted_class"] == "unknown"

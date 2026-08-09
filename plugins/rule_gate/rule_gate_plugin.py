@@ -24,10 +24,13 @@ the IF's high_level_data) and fires on:
   R3 sb-errors      : CFE_SB.MsgSendErrorCounter per-frame delta > 0.
   R4 cmd-errors     : any `*.CommandError{Count,Counter}` per-frame delta > thresh.
   R5 monitor-state  : a monitoring/limit-check state field (e.g. LC.CurrentLCState)
-                      leaves its protective session baseline — the safe-mode
-                      induction step (EX-0011/DE-0005) that disables LC/HS/limit
-                      checking. Validated 2026-07-16: LC.CurrentLCState 1→3 was
-                      blind to both the dynamics-IF and the other rule-gate rules.
+                      leaves its protective session baseline — the fault-management
+                      / safe-mode disable step that turns off LC/HS/limit checking.
+                      Shared, telemetry-indistinguishable footprint across the family
+                      (LC.CurrentLCState 1→3): EX-0011 (exploit safe-mode), DE-0005
+                      (subvert safe-mode), DE-0001 (disable fault management).
+                      Validated 2026-07-16 (EX-0011/DE-0005) + 2026-07-29 (DE-0001,
+                      AINOS3-73); blind to both the dynamics-IF and the other rules.
   R6 sb-command     : CFE_SB.CommandCounter reaches a new high — a CFE_SB command
                       (ENABLE/DISABLE_ROUTE, subscription report). Static in nominal
                       ops, so any command is the direct EX-0012.02 routing-table
@@ -156,10 +159,19 @@ def _device_label(rule_id: str) -> str:
 
 
 def _monstate_label(rule_id: str) -> str:
-    """Human label for an R5 monitor-state alert (rule-id `R5:{app}-monstate`)."""
+    """Human label for an R5 monitor-state alert (rule-id `R5:{app}-monstate`).
+
+    The LC-disable footprint (CurrentLCState → DISABLED) is shared and
+    telemetry-indistinguishable across the fault-management/safe-mode family:
+    EX-0011 (exploit safe-mode), DE-0005 (subvert safe-mode), and DE-0001
+    (disable fault management). All three drive LC.CurrentLCState 1→3; they
+    differ only by accompanying steps (EX-0011 adds thruster physics the IF
+    catches; DE-0005 forces an ADCS mode; DE-0001 is LC/HS-only). Validated
+    live 2026-07-29 (AINOS3-73): DE-0001's LC-disable latches this same R5."""
     app = rule_id.split(":", 1)[1].rsplit("-", 1)[0]
     return (f"{app} monitoring/limit-check state left its protective baseline "
-            f"(EX-0011 safe-mode induction / DE-0005)")
+            f"(fault-management disable — DE-0001 / EX-0011 safe-mode "
+            f"induction / DE-0005)")
 
 
 def _incident_label(active_rules):
