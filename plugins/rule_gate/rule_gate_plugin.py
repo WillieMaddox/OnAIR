@@ -84,6 +84,27 @@ the IF's high_level_data) and fires on:
                       same-destination redirect that leaves the mask unchanged is still
                       caught by R12's command-counter increment. Baseline-deviation +
                       leaky-integrator flicker tolerance, same as R5 monitor-state.
+  R14 adcs-mode     : ADCS_GNC.Mode moved to a different flight mode — a forced
+                      GENERIC_ADCS SET_MODE (0x1940 FC2), the DE-0005 safe-mode-
+                      subversion step. This is a pure IF BLIND SPOT: a mode force
+                      re-arms the per-mode router's 250-frame warmup, during which
+                      dynamics detection is suppressed entirely, so the attack slips
+                      Stage 1 by construction. Mode-transition *legitimacy* is an
+                      operator decision, so the rule fires on any confirmed transition
+                      and the rule IS the label.
+
+                      NOT a command-counter rule: ADCS_HK.CommandCount is a wrapping
+                      uint8 that increments on routine HK polling (264,019 changes over
+                      a 7 h nominal soak), so it fails the static-in-nominal precondition
+                      R6-R13 depend on. Keyed on the mode value instead.
+
+                      DEBOUNCED, unlike R5/R13: OnAIR's double-buffer makes the mode
+                      oscillate between old and new for several frames at each
+                      transition. Measured on the AINOS3-81 soak, naive change-detection
+                      fires 22 times for 4 real transitions; requiring the new value to
+                      persist ModeDebounceFrames frames collapses that to exactly 4.
+                      After a confirmed transition the new mode becomes the baseline, so
+                      holding a mode never fires (0 fires across ~265 K nominal frames).
 
 The rule that fires IS the label (R1:NOVATEL → GPS disable, etc.), so no XGBoost
 classifier is needed for this class. The two gates are complementary: the IF owns
@@ -136,7 +157,13 @@ _TECH_LABEL = {
     "R11:fm-command": "File Manager command — file-operation burst (EX-0010.01 ransomware / EX-0010.02 wiper)",
     "R12:to-command": "Telemetry Output command — downlink reconfigure (EXF-0003.02 downlink exfiltration)",
     "R13:to-route": "Downlink route mask changed — downlink reconfigured (EXF-0003.02 exfil / IMP-0006 theft)",
+    "R14:adcs-mode": "ADCS flight mode forced — unexpected SET_MODE transition (DE-0005 subvert safe-mode)",
+    "R14:adcs-mode-flap": "ADCS mode FLAPPING — repeated forced transitions, consistent with "
+                          "farming the detector's post-switch blind window (DE-0005)",
 }
+
+# ADCS_GNC.Mode codes (components/onair/training/scenarios/cmd.py).
+_ADCS_MODE_NAME = {0: "PASSIVE", 1: "BDOT", 2: "SUNSAFE", 3: "INERTIAL"}
 
 
 def _to_num(value):
@@ -184,8 +211,18 @@ def _incident_label(active_rules):
     multi-command sweep as LM-0002 (rather than collapsing to its loudest single rule).
     """
     def _prio(r):
-        return {"R1": 0, "R10": 1, "R5": 2, "R13": 2, "R6": 3, "R7": 3, "R8": 3,
-                "R9": 3, "R11": 3, "R12": 3, "R2": 4, "R4": 5, "R3": 6}.get(
+        # R14 sits with R5 (state-change): a mode force accompanied by an LC disable
+        # is the DE-0005 pattern, and R5's EX-0011 label is the family representative,
+        # so R5 keeps precedence when both fire. R14 alone labels DE-0005.
+        #
+        # The flap sub-rule outranks the single-transition rule: when both are
+        # active, "repeated forced transitions" is the accurate description and
+        # "one mode force" understates it. The incident aggregator votes on the
+        # label by frame count, so this pairs with the flap rule's longer dwell.
+        if r == "R14:adcs-mode-flap":
+            return 2.4
+        return {"R1": 0, "R10": 1, "R5": 2, "R13": 2, "R14": 2.5, "R6": 3, "R7": 3,
+                "R8": 3, "R9": 3, "R11": 3, "R12": 3, "R2": 4, "R4": 5, "R3": 6}.get(
                     r.split(":", 1)[0], 7)
     if not active_rules:
         return "", ""
@@ -215,6 +252,10 @@ def _incident_label(active_rules):
         return "EXF-0003.02", "to-command"
     if r == "R13:to-route":
         return "EXF-0003.02", "to-route"
+    if r == "R14:adcs-mode-flap":
+        return "DE-0005", "adcs-mode-flapping"
+    if r == "R14:adcs-mode":
+        return "DE-0005", "adcs-mode-force"
     if r == "R2:evs":
         return "DE-0010", "evs-flood"
     if r == "R3:sb":
@@ -251,6 +292,30 @@ class Plugin(AIPlugin):
         # nominal session baseline means the downlink was reconfigured (EXF-0003.02).
         # The full TO app's route masks are static in nominal; a change = exfil signal.
         "RouteStateFields": "TO.usEnabledRoutes,TO.usConfigRoutes",
+        # R14 mode-state (AINOS3-77): the ADCS flight-mode field. A confirmed change =
+        # a forced SET_MODE (DE-0005). Unlike R5/R13 this re-baselines to the new value
+        # after firing, so it reports one bounded event per transition rather than
+        # latching until the mode is restored.
+        "ModeStateFields": "ADCS_GNC.Mode",
+        # Frames the new mode must persist before a transition is confirmed. OnAIR's
+        # double-buffer oscillates old/new for a few frames at each switch; measured on
+        # the 7 h AINOS3-81 soak, 1 gives 22 fires for 4 real transitions and >=2 gives
+        # exactly 4. Default 5 for margin (~0.9 s at 5.6 Hz) — negligible against the
+        # 250-frame IF warmup this rule exists to cover.
+        "ModeDebounceFrames": "5",
+        # R14 flap sub-rule: N confirmed transitions inside this window is not an
+        # operator repointing the spacecraft — it is someone harvesting the IF's
+        # post-switch blind window. The IF suppresses alerts for
+        # ModeSwitchWarmupFrames (250, ~45 s) after every mode change, so an
+        # attacker who switches faster than that holds the dynamics detector off
+        # indefinitely. A single switch is R14:adcs-mode; the repetition is a
+        # materially stronger signal and gets its own rule-id and label.
+        # Defaults: 3 transitions inside ~5 min (1700 frames @ ~5.6 Hz). Nominal
+        # ops changed mode 4 times in 7 h (AINOS3-81) — nowhere near. Sustained
+        # blind-window farming needs a switch every <45 s, i.e. ~7 per 5 min, so
+        # 3 sits well clear of nominal and well below the attack rate.
+        "ModeFlapWindowFrames": "1700",
+        "ModeFlapMinTransitions": "3",
         # R6/R7 command rules: CFE_SB.CommandCounter and CFE_EVS_HK.CommandCounter are
         # STATIC in nominal ops (nothing routinely commands the Software Bus or Event
         # Services), so any increment = an attacker command — R6 CFE_SB
@@ -333,6 +398,14 @@ class Plugin(AIPlugin):
         self._routestate_idx = {f.strip(): idx[f.strip()]
                                 for f in route_cfg.split(",")
                                 if f.strip() and f.strip() in idx}
+        # R14 mode-state (AINOS3-77): the ADCS flight-mode field, debounced.
+        mode_cfg = cfg.get("modestatefields", self.DEFAULTS["ModeStateFields"])
+        self._modestate_idx = {f.strip(): idx[f.strip()]
+                               for f in mode_cfg.split(",")
+                               if f.strip() and f.strip() in idx}
+        self._mode_debounce = _int("ModeDebounceFrames")
+        self._mode_flap_window = _int("ModeFlapWindowFrames")
+        self._mode_flap_min = _int("ModeFlapMinTransitions")
 
         # The full set of rule-ids that can ever fire (so the leaky counter
         # decays even on frames a rule is quiet).
@@ -351,6 +424,9 @@ class Plugin(AIPlugin):
             self._rule_ids.add(rid)
         if self._routestate_idx:
             self._rule_ids.add("R13:to-route")
+        if self._modestate_idx:
+            self._rule_ids.add("R14:adcs-mode")
+            self._rule_ids.add("R14:adcs-mode-flap")
         # R10 bus-sweep meta-rule can only fire if enough command counters exist to
         # cross the threshold; register it only then.
         if len(self._cmd_rule) >= self._bus_sweep_min:
@@ -365,6 +441,18 @@ class Plugin(AIPlugin):
         # R13 route-state baseline = the downlink route mask at warmup (static in
         # nominal). None until a real value arrives; a later deviation fires.
         self._routestate_baseline = {f: None for f in self._routestate_idx}
+        # R14 mode-state: the confirmed-stable mode, plus the debounce candidate and
+        # its run length. `_mode_dwell` holds the fire long enough for the leaky
+        # integrator to latch one bounded incident (same trick as R6-R13's CmdDwell).
+        self._mode_stable = {f: None for f in self._modestate_idx}
+        self._mode_cand = {f: None for f in self._modestate_idx}
+        self._mode_cand_n = {f: 0 for f in self._modestate_idx}
+        self._mode_dwell = 0
+        self._mode_last_transition = None
+        # Frame indices of confirmed transitions, pruned to the flap window.
+        self._mode_transitions: list[int] = []
+        self._mode_flap_dwell = 0
+        self._mode_flap_count = 0
         # R6/R7: per command-counter running max (a new high = a new command) + a
         # dwell countdown so a single-step command latches the leaky integrator.
         self._cmd_max = {i: None for i in self._cmd_rule}
@@ -406,6 +494,9 @@ class Plugin(AIPlugin):
               f"({', '.join(self._monstate_idx) or 'none'}), "
               f"{len(self._routestate_idx)} route-state fields "
               f"({', '.join(self._routestate_idx) or 'none'}), "
+              f"{len(self._modestate_idx)} mode-state fields "
+              f"({', '.join(self._modestate_idx) or 'none'}, "
+              f"debounce={self._mode_debounce}), "
               f"EVS={'y' if self._evs_idx is not None else 'n'} "
               f"SB={'y' if self._sb_idx is not None else 'n'}; "
               f"warmup={self._warmup_frames}, leaky "
@@ -490,6 +581,61 @@ class Plugin(AIPlugin):
                 self._routestate_baseline[f] = v
             elif v != self._routestate_baseline[f]:
                 fired.add("R13:to-route")
+        # R14 mode-state (AINOS3-77): a CONFIRMED ADCS flight-mode transition = a forced
+        # SET_MODE (DE-0005). The IF cannot see this — the per-mode router re-arms a
+        # 250-frame warmup on every mode change, suppressing dynamics detection exactly
+        # when the attack lands. Debounced because OnAIR's double-buffer oscillates
+        # old/new for several frames per switch; re-baselines after firing so that
+        # simply *being* in a mode never fires, only *entering* one.
+        for f, i in self._modestate_idx.items():
+            v = val(i)
+            if v is None:
+                continue
+            if self._mode_stable[f] is None:
+                # Warmup: establish the session's starting mode without firing.
+                if v == self._mode_cand[f]:
+                    self._mode_cand_n[f] += 1
+                else:
+                    self._mode_cand[f], self._mode_cand_n[f] = v, 1
+                if self._mode_cand_n[f] >= self._mode_debounce:
+                    self._mode_stable[f] = v
+                    self._mode_cand[f], self._mode_cand_n[f] = None, 0
+            elif v != self._mode_stable[f]:
+                if v == self._mode_cand[f]:
+                    self._mode_cand_n[f] += 1
+                else:
+                    self._mode_cand[f], self._mode_cand_n[f] = v, 1
+                if self._mode_cand_n[f] >= self._mode_debounce:
+                    self._mode_last_transition = (
+                        _ADCS_MODE_NAME.get(int(self._mode_stable[f]), self._mode_stable[f]),
+                        _ADCS_MODE_NAME.get(int(v), v))
+                    self._mode_stable[f] = v      # the new mode is the new baseline
+                    self._mode_cand[f], self._mode_cand_n[f] = None, 0
+                    self._mode_dwell = self._cmd_dwell_frames
+                    # Flap tracking: keep only transitions inside the window.
+                    now_f = self._frame_count
+                    self._mode_transitions.append(now_f)
+                    self._mode_transitions = [
+                        t for t in self._mode_transitions
+                        if now_f - t <= self._mode_flap_window]
+                    if len(self._mode_transitions) >= self._mode_flap_min:
+                        self._mode_flap_count = len(self._mode_transitions)
+                        # 4x the single-transition dwell. A flapping episode is
+                        # ongoing rather than momentary, so the operator should see
+                        # a sustained alert instead of an 8-frame blip — and the
+                        # incident aggregator votes on the label by frame count, so
+                        # a short dwell would let the weaker "one mode force" label
+                        # win the very incident that flapping defines.
+                        self._mode_flap_dwell = self._cmd_dwell_frames * 4
+            else:
+                # Back on the stable value — the candidate run was buffer flicker.
+                self._mode_cand[f], self._mode_cand_n[f] = None, 0
+        if self._mode_dwell > 0:
+            fired.add("R14:adcs-mode")
+            self._mode_dwell -= 1
+        if self._mode_flap_dwell > 0:
+            fired.add("R14:adcs-mode-flap")
+            self._mode_flap_dwell -= 1
         # R6/R7 command rules: a NEW HIGH of a static `*.CommandCounter` = an attacker
         # command was processed (R6 CFE_SB → routing/subscription modification; R7
         # CFE_EVS → event-type suppression / DE-0002.03 inhibit). The running max
@@ -556,6 +702,17 @@ class Plugin(AIPlugin):
                 label = _device_label(r)
             elif r.startswith("R5:"):
                 label = _monstate_label(r)
+            elif r == "R14:adcs-mode-flap":
+                label = (f"ADCS mode FLAPPING — {self._mode_flap_count} forced "
+                         f"transitions within {self._mode_flap_window} frames. Each "
+                         f"switch re-arms the IF's ~45 s blind window, so this "
+                         f"pattern holds dynamics detection off continuously "
+                         f"(DE-0005 subvert safe-mode)")
+            elif r == "R14:adcs-mode" and self._mode_last_transition:
+                a, b = self._mode_last_transition
+                label = (f"ADCS flight mode forced {a} → {b} — unexpected SET_MODE "
+                         f"(DE-0005 subvert safe-mode; IF is blind here, the per-mode "
+                         f"router re-arms its warmup on every switch)")
             else:
                 label = _TECH_LABEL.get(r) or r.split(":", 1)[1]
             print(f"[rule_gate][{kind}] frame={self._frame_count} rule={r} — {label}")

@@ -623,3 +623,204 @@ def test_r13_emits_exf0003_02_incident():
         _feed_rt(p, 0, 0)
     assert closed, "a to-route incident should open then close"
     assert closed[0].cluster == "EXF-0003.02" and "to-route" in closed[0].sub_technique
+
+
+# ── R14 ADCS mode-force (AINOS3-77) ──────────────────────────────────────────
+# Mode codes (cmd.py): 0=PASSIVE 1=BDOT 2=SUNSAFE 3=INERTIAL.
+# Note HRT already carries ADCS_GNC.Mode at a constant "2", so every R13 test
+# above doubles as an implicit R14 no-fire check.
+
+def _feed_mode(p, mode):
+    _feed_rt(p, 0, 0, mode=str(mode))
+
+
+def _warmup_mode(p, mode=2):
+    for _ in range(31):
+        _feed_mode(p, mode)
+
+
+def test_r14_mode_force_latches():
+    p = _mk(HRT)
+    _warmup_mode(p, 2)                    # baseline SUNSAFE
+    for _ in range(6):                    # forced SET_MODE INERTIAL, sustained
+        _feed_mode(p, 3)
+    assert "R14:adcs-mode" in p._latest_active
+
+
+def test_r14_static_mode_never_fires():
+    p = _mk(HRT)
+    _warmup_mode(p, 2)
+    for _ in range(40):                   # holding a mode is not a transition
+        _feed_mode(p, 2)
+    assert "R14:adcs-mode" not in p._latest_active
+
+
+def test_r14_debounce_rejects_double_buffer_flicker():
+    """The AINOS3-81 soak finding: OnAIR's double buffer oscillates old/new at
+    every switch, and naive change-detection fired 22 times for 4 real
+    transitions. A candidate that never persists `ModeDebounceFrames` frames
+    must not be treated as a transition."""
+    p = _mk(HRT)
+    _warmup_mode(p, 2)
+    for _ in range(20):
+        _feed_mode(p, 3)                  # fresh buffer
+        _feed_mode(p, 2)                  # stale buffer flickers back
+    assert "R14:adcs-mode" not in p._latest_active
+    assert p._mode_stable["ADCS_GNC.Mode"] == 2.0
+
+
+def test_r14_rebaselines_to_the_new_mode():
+    """Unlike R5/R13 (which latch until the field returns to baseline), a mode
+    force is one bounded event: after the dwell the new mode is the new normal."""
+    p = _mk(HRT)
+    _warmup_mode(p, 2)
+    for _ in range(6):
+        _feed_mode(p, 3)
+    assert "R14:adcs-mode" in p._latest_active
+    assert p._mode_stable["ADCS_GNC.Mode"] == 3.0
+    for _ in range(40):                   # keep holding INERTIAL
+        _feed_mode(p, 3)
+    assert "R14:adcs-mode" not in p._latest_active
+
+
+def test_r14_fires_again_on_a_second_transition():
+    p = _mk(HRT)
+    _warmup_mode(p, 2)
+    for _ in range(6):
+        _feed_mode(p, 3)
+    for _ in range(40):
+        _feed_mode(p, 3)                  # quiesce
+    for _ in range(6):
+        _feed_mode(p, 0)                  # forced again: INERTIAL -> PASSIVE
+    assert "R14:adcs-mode" in p._latest_active
+    assert p._mode_last_transition == ("INERTIAL", "PASSIVE")
+
+
+def test_r14_records_the_transition_for_the_operator_label():
+    p = _mk(HRT)
+    _warmup_mode(p, 2)
+    for _ in range(6):
+        _feed_mode(p, 3)
+    assert p._mode_last_transition == ("SUNSAFE", "INERTIAL")
+
+
+def test_r14_emits_de0005_incident():
+    p = _mk(HRT)
+    _warmup_mode(p, 2)
+    closed = []
+    p._write_incident = lambda inc: closed.append(inc)
+    for _ in range(8):
+        _feed_mode(p, 3)
+    for _ in range(30):                   # dwell expires -> leaky decays -> closes
+        _feed_mode(p, 3)
+    assert closed, "a mode-force incident should open then close"
+    assert closed[0].cluster == "DE-0005"
+    assert "adcs-mode-force" in closed[0].sub_technique
+
+
+def test_r14_yields_to_r5_when_both_fire():
+    """DE-0005 subverts safe mode by disabling LC *and* forcing a mode. R5's
+    EX-0011 is the family representative, so the incident keeps that label."""
+    from plugins.rule_gate.rule_gate_plugin import _incident_label
+    cluster, _ = _incident_label(["R14:adcs-mode", "R5:LC-monstate"])
+    assert cluster == "EX-0011"
+    cluster, sub = _incident_label(["R14:adcs-mode"])
+    assert cluster == "DE-0005" and sub == "adcs-mode-force"
+
+
+def test_r14_not_registered_when_mode_field_absent():
+    p = _mk(H)                            # H has no ADCS_GNC.Mode
+    assert p._modestate_idx == {}
+    assert "R14:adcs-mode" not in p._rule_ids
+
+
+def test_r14_ignores_init_sentinel():
+    p = _mk(HRT)
+    _warmup_mode(p, 2)
+    for _ in range(10):
+        _feed(p, HRT, {"IMU.DeviceEnabled": "1",
+                       "CFE_EVS_HK.MessageSendCounter": "131",
+                       "CFE_SB.MsgSendErrorCounter": "0",
+                       "ADCS_HK.CommandErrorCount": "0",
+                       "TO.usEnabledRoutes": "0", "TO.usConfigRoutes": "0",
+                       "ADCS_GNC.Mode": "[0]"})
+    assert "R14:adcs-mode" not in p._latest_active
+    assert p._mode_stable["ADCS_GNC.Mode"] == 2.0
+
+
+# ── R14 mode-flapping sub-rule (AINOS3-77 follow-on) ─────────────────────────
+# A single switch is R14:adcs-mode. Repeated switching is a materially stronger
+# signal: each one re-arms the IF's ~45 s post-switch blind window, so an
+# attacker switching faster than that holds dynamics detection off indefinitely.
+
+def _transition(p, to_mode, hold=8):
+    """One confirmed transition: debounce frames to confirm, then settle."""
+    for _ in range(hold):
+        _feed_mode(p, to_mode)
+
+
+def test_r14_flap_does_not_fire_on_a_single_transition():
+    p = _mk(HRT)
+    _warmup_mode(p, 2)
+    _transition(p, 3)
+    assert "R14:adcs-mode" in p._latest_active
+    assert "R14:adcs-mode-flap" not in p._latest_active
+
+
+def test_r14_flap_does_not_fire_below_the_threshold():
+    p = _mk(HRT)
+    _warmup_mode(p, 2)
+    _transition(p, 3)
+    _transition(p, 0)                     # 2 transitions — still under the min of 3
+    assert "R14:adcs-mode-flap" not in p._latest_active
+
+
+def test_r14_flap_fires_on_the_third_transition_in_window():
+    p = _mk(HRT)
+    _warmup_mode(p, 2)
+    _transition(p, 3)
+    _transition(p, 0)
+    _transition(p, 1)                     # 3rd inside the window
+    assert "R14:adcs-mode-flap" in p._latest_active
+    assert p._mode_flap_count >= 3
+
+
+def test_r14_flap_ignores_transitions_older_than_the_window():
+    """Two transitions now and one from long ago is not flapping."""
+    p = _mk(HRT)
+    _warmup_mode(p, 2)
+    _transition(p, 3)                     # transition 1
+    for _ in range(p._mode_flap_window + 20):   # let it age out of the window
+        _feed_mode(p, 3)
+    _transition(p, 0)                     # transition 2 (1 is now stale)
+    _transition(p, 1)                     # transition 3
+    # Only 2 transitions are inside the window, so no flap.
+    assert "R14:adcs-mode-flap" not in p._latest_active
+
+
+def test_r14_flap_emits_a_distinct_incident_label():
+    p = _mk(HRT)
+    _warmup_mode(p, 2)
+    closed = []
+    p._write_incident = lambda inc: closed.append(inc)
+    _transition(p, 3)
+    _transition(p, 0)
+    _transition(p, 1)
+    for _ in range(40):                   # quiesce so the incident closes
+        _feed_mode(p, 1)
+    assert closed, "a flapping incident should open then close"
+    assert closed[0].cluster == "DE-0005"
+    assert "flapping" in closed[0].sub_technique
+
+
+def test_r14_flap_label_distinguishes_from_single_force():
+    from plugins.rule_gate.rule_gate_plugin import _incident_label
+    c1, s1 = _incident_label(["R14:adcs-mode"])
+    c2, s2 = _incident_label(["R14:adcs-mode-flap"])
+    assert c1 == c2 == "DE-0005"
+    assert s1 == "adcs-mode-force" and s2 == "adcs-mode-flapping"
+
+
+def test_r14_flap_not_registered_without_the_mode_field():
+    p = _mk(H)
+    assert "R14:adcs-mode-flap" not in p._rule_ids
