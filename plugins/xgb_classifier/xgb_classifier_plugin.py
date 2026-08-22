@@ -146,7 +146,7 @@ class Plugin(AIPlugin):
         "AlertHysteresis": "3",
         "ClearHysteresis": "5",
         "IncidentMinAnomalyFrames": "1",
-        # ─── NOS3-312: explanation catalog ───────────────────────────
+        # ─── AINOS3-40: explanation catalog ───────────────────────────
         # Per-class "top telemetry fields that drive this class", precomputed
         # offline by build_explanation_catalog.py (the flight runtime has no
         # shap). Empty ⇒ derive as a sibling of the classifier pickle; missing
@@ -218,7 +218,7 @@ class Plugin(AIPlugin):
             print(f"[xgb_cls] no cluster taxonomy at {tax_path}; "
                   f"reporting raw sub-techniques")
 
-        # ─── NOS3-312: explanation catalog ───────────────────────────
+        # ─── AINOS3-40: explanation catalog ───────────────────────────
         # Per-class top telemetry fields that drive the classification,
         # precomputed offline (no shap in the flight runtime). Attached to each
         # incident's side-file row. Missing ⇒ incidents omit the column.
@@ -574,7 +574,7 @@ class Plugin(AIPlugin):
                   f"({top1_prob*100:.0f}%)")
 
     def _explanation_for(self, inc) -> str:
-        """NOS3-312: precomputed top telemetry fields for this incident's winning
+        """AINOS3-40: precomputed top telemetry fields for this incident's winning
         sub-technique (falling back to its cluster). Empty if not catalogued."""
         return (self._explanation_str.get(inc.sub_technique)
                 or self._explanation_str.get(inc.cluster) or "")
