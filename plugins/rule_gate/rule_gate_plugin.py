@@ -157,6 +157,10 @@ _TECH_LABEL = {
     "R11:fm-command": "File Manager command — file-operation burst (EX-0010.01 ransomware / EX-0010.02 wiper)",
     "R12:to-command": "Telemetry Output command — downlink reconfigure (EXF-0003.02 downlink exfiltration)",
     "R13:to-route": "Downlink route mask changed — downlink reconfigured (EXF-0003.02 exfil / IMP-0006 theft)",
+    "R16:cf-command": "CFDP command — file transfer initiated or reconfigured "
+                      "(EX-0010 file-op burst / EXF-0003.02 exfiltration)",
+    "R16:cf-fault": "CFDP file-operation faults — files failing to open, read or "
+                    "checksum during a transfer (EX-0010.01 ransomware / EX-0010.02 wiper)",
     "R15:gps-time-divergence": "GPS time diverged from the flight-software clock — "
                                "time spoof or SET_TIME injection (EX-0014.01 / EX-0012.12)",
     "R14:adcs-mode": "ADCS flight mode forced — unexpected SET_MODE transition (DE-0005 subvert safe-mode)",
@@ -223,7 +227,12 @@ def _incident_label(active_rules):
         # label by frame count, so this pairs with the flap rule's longer dwell.
         if r == "R14:adcs-mode-flap":
             return 2.4
-        return {"R1": 0, "R10": 1, "R5": 2, "R13": 2, "R14": 2.5, "R6": 3, "R7": 3,
+        # Same shape: when a CFDP transfer AND file-operation faults fire together, the
+        # accurate description is files failing during the transfer (EX-0010), not that a
+        # transfer happened (EXF-0003.02). Faults therefore outrank the bare command.
+        if r == "R16:cf-fault":
+            return 2.4
+        return {"R1": 0, "R10": 1, "R5": 2, "R13": 2, "R16": 2.5, "R14": 2.5, "R6": 3, "R7": 3,
                 "R8": 3, "R9": 3, "R11": 3, "R12": 3, "R2": 4, "R4": 5, "R3": 6}.get(
                     r.split(":", 1)[0], 7)
     if not active_rules:
@@ -256,6 +265,10 @@ def _incident_label(active_rules):
         return "EXF-0003.02", "to-route"
     if r == "R14:adcs-mode-flap":
         return "DE-0005", "adcs-mode-flapping"
+    if r == "R16:cf-command":
+        return "EXF-0003.02", "cfdp-transfer-command"
+    if r == "R16:cf-fault":
+        return "EX-0010", "cfdp-file-faults"
     if r == "R15:gps-time-divergence":
         return "EX-0014.01", "gps-met-divergence"
     if r == "R14:adcs-mode":
@@ -429,9 +442,23 @@ class Plugin(AIPlugin):
                            ("CFE_ES.CommandCounter", "R8:es-command"),
                            ("CFE_TBL.CommandCounter", "R9:tbl-command"),
                            ("FM.CommandCounter", "R11:fm-command"),
-                           ("TO.usCmdCnt", "R12:to-command")):
+                           ("TO.usCmdCnt", "R12:to-command"),
+                           ("CF.counters.cmd", "R16:cf-command")):
             if field in idx:
                 self._cmd_rule[idx[field]] = rid
+        # R16 cf-fault (AINOS3-103): the CFDP per-channel file-operation fault counters.
+        # Measured static at 0 across 15,312 nominal frames — CF is idle unless a
+        # transfer runs — so any advance is real file-operation trouble: a wiper
+        # deleting files under an active transfer (EX-0010.02), a ransomware rewrite
+        # breaking checksums (EX-0010.01), or an exfil transfer failing. All 22 columns
+        # share ONE rule id, so a burst reads as a single signal rather than 22.
+        for _ch in (0, 1):
+            for _f in ("file_open", "file_read", "file_seek", "file_write", "file_rename",
+                       "directory_read", "crc_mismatch", "file_size_mismatch",
+                       "nak_limit", "ack_limit", "inactivity_timer"):
+                _fld = f"CF.channel{_ch}.counters.fault.{_f}"
+                if _fld in idx:
+                    self._cmd_rule[idx[_fld]] = "R16:cf-fault"
         # R5 monitor-state fields present in this schema, name → column index.
         monstate_cfg = cfg.get("monitorstatefields", self.DEFAULTS["MonitorStateFields"])
         self._monstate_idx = {f.strip(): idx[f.strip()]
@@ -779,7 +806,11 @@ class Plugin(AIPlugin):
         # tripped in the same window. The individual command dwells overlap during a
         # sweep, so counting the distinct command rules firing THIS frame catches it.
         if "R10:bus-sweep" in self._rule_ids:
-            n_cmd = sum(1 for rid in self._cmd_rule.values() if rid in fired)
+            # DISTINCT rule ids, not entries: several columns may share one rule id
+            # (R16:cf-fault maps 22 CFDP fault counters), and counting entries would
+            # trip the sweep threshold on a single app's activity. Latent until CF was
+            # added — every earlier rule owned exactly one column.
+            n_cmd = len({rid for rid in self._cmd_rule.values() if rid in fired})
             if n_cmd >= self._bus_sweep_min:
                 fired.add("R10:bus-sweep")
 

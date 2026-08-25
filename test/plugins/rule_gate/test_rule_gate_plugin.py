@@ -985,3 +985,109 @@ def test_r15_survives_frames_with_no_gps_fix():
     for k in range(30, 60):
         _feed_td(p, g + k, m + k)                    # fix returns, nominal
     assert "R15:gps-time-divergence" not in p._latest_active
+
+
+# ---------------------------------------------------------------------------
+# R16 CFDP file operations (AINOS3-103)
+#
+# CF is idle unless a transfer runs: all 55 CF columns measured constant across
+# 15,312 nominal frames. That makes every CF counter static-in-nominal, the same
+# property R6-R13 exploit. R16:cf-command tracks the app command counter;
+# R16:cf-fault shares ONE rule id across all 22 per-channel fault counters so a
+# burst reads as one signal rather than 22.
+# ---------------------------------------------------------------------------
+
+HCF = ["IMU.DeviceEnabled", "CFE_EVS_HK.MessageSendCounter",
+       "CFE_SB.MsgSendErrorCounter", "ADCS_HK.CommandErrorCount",
+       "CF.counters.cmd", "CF.counters.err",
+       "CF.channel0.counters.fault.file_open",
+       "CF.channel0.counters.fault.file_read",
+       "CF.channel0.counters.fault.crc_mismatch",
+       "CF.channel1.counters.fault.file_write"]
+
+
+def _feed_cf(p, cmd=0, f_open=0, f_read=0, f_crc=0, f_write=0):
+    _feed(p, HCF, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": "131",
+                   "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0",
+                   "CF.counters.cmd": str(cmd), "CF.counters.err": "0",
+                   "CF.channel0.counters.fault.file_open": str(f_open),
+                   "CF.channel0.counters.fault.file_read": str(f_read),
+                   "CF.channel0.counters.fault.crc_mismatch": str(f_crc),
+                   "CF.channel1.counters.fault.file_write": str(f_write)})
+
+
+def _warmup_cf(p, n=31):
+    for _ in range(n):
+        _feed_cf(p)
+
+
+def test_r16_registered_when_cf_columns_present():
+    p = _mk(HCF)
+    assert "R16:cf-command" in p._rule_ids
+    assert "R16:cf-fault" in p._rule_ids
+
+
+def test_r16_not_registered_without_cf():
+    p = _mk(H)
+    assert "R16:cf-command" not in p._rule_ids
+    assert "R16:cf-fault" not in p._rule_ids
+
+
+def test_r16_nominal_never_fires():
+    """All 55 CF columns measured constant over 15,312 nominal frames."""
+    p = _mk(HCF)
+    _warmup_cf(p)
+    for _ in range(60):
+        _feed_cf(p)
+    assert "R16:cf-command" not in p._latest_active
+    assert "R16:cf-fault" not in p._latest_active
+
+
+def test_r16_command_fires_on_a_cfdp_command():
+    p = _mk(HCF)
+    _warmup_cf(p)
+    for _ in range(4):
+        _feed_cf(p, cmd=1)
+    assert "R16:cf-command" in p._latest_active
+
+
+def test_r16_fault_fires_on_a_file_operation_fault():
+    p = _mk(HCF)
+    _warmup_cf(p)
+    for _ in range(4):
+        _feed_cf(p, f_open=3)
+    assert "R16:cf-fault" in p._latest_active
+
+
+def test_r16_fault_shared_across_channels_and_fields():
+    """A fault on channel 1 is the same signal as one on channel 0 — one rule id."""
+    p = _mk(HCF)
+    _warmup_cf(p)
+    for _ in range(4):
+        _feed_cf(p, f_write=2)
+    assert "R16:cf-fault" in p._latest_active
+
+
+def test_r16_fault_burst_does_not_trip_the_bus_sweep():
+    """The R10 regression this change had to fix: 22 fault columns share one rule
+    id, and R10 counted _cmd_rule ENTRIES rather than distinct ids, so a single
+    app's fault burst would have crossed the 3-distinct-rule sweep threshold."""
+    p = _mk(HCF)
+    _warmup_cf(p)
+    for _ in range(6):
+        _feed_cf(p, f_open=4, f_read=4, f_crc=4, f_write=4)
+    assert "R16:cf-fault" in p._latest_active
+    assert "R10:bus-sweep" not in p._latest_active
+
+
+def test_r16_faults_outrank_a_bare_transfer_for_the_incident_label():
+    """Files failing during a transfer is EX-0010, not 'a transfer happened'."""
+    cluster, sub = _incident_label(["R16:cf-command", "R16:cf-fault"])
+    assert cluster == "EX-0010"
+    assert sub == "cfdp-file-faults"
+
+
+def test_r16_command_alone_labels_exfiltration():
+    cluster, sub = _incident_label(["R16:cf-command"])
+    assert cluster == "EXF-0003.02"
+    assert sub == "cfdp-transfer-command"
