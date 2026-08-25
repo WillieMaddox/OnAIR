@@ -157,6 +157,8 @@ _TECH_LABEL = {
     "R11:fm-command": "File Manager command — file-operation burst (EX-0010.01 ransomware / EX-0010.02 wiper)",
     "R12:to-command": "Telemetry Output command — downlink reconfigure (EXF-0003.02 downlink exfiltration)",
     "R13:to-route": "Downlink route mask changed — downlink reconfigured (EXF-0003.02 exfil / IMP-0006 theft)",
+    "R15:gps-time-divergence": "GPS time diverged from the flight-software clock — "
+                               "time spoof or SET_TIME injection (EX-0014.01 / EX-0012.12)",
     "R14:adcs-mode": "ADCS flight mode forced — unexpected SET_MODE transition (DE-0005 subvert safe-mode)",
     "R14:adcs-mode-flap": "ADCS mode FLAPPING — repeated forced transitions, consistent with "
                           "farming the detector's post-switch blind window (DE-0005)",
@@ -254,6 +256,8 @@ def _incident_label(active_rules):
         return "EXF-0003.02", "to-route"
     if r == "R14:adcs-mode-flap":
         return "DE-0005", "adcs-mode-flapping"
+    if r == "R15:gps-time-divergence":
+        return "EX-0014.01", "gps-met-divergence"
     if r == "R14:adcs-mode":
         return "DE-0005", "adcs-mode-force"
     if r == "R2:evs":
@@ -323,6 +327,51 @@ class Plugin(AIPlugin):
         # DE-0002.03 inhibit). A command is a single new-high step, so we hold the fire
         # for CmdDwell frames to let the leaky integrator latch one bounded incident.
         "CmdDwell": "8",
+        # R15 gps-time-divergence (AINOS3-95): the GN&C sheet of SPARTA's logging
+        # workbook names "time interval discrepancy" as a GPS spoof indicator, and we
+        # already record BOTH clocks in every frame without ever comparing them.
+        #
+        # ⚠ The naive difference is unusable. Measured on a clean stack, the raw
+        # per-frame divergence has a 29 s spread: OnAIR's double buffer corrupts BOTH
+        # operands — GPS SecondsIntoWeek steps BACKWARD 58 times in 3 min, and
+        # CFE_TIME.SecondsMET oscillates between two values ~4 s apart in adjacent
+        # frames. MET staleness does not explain it (corr = -0.055), and splitting the
+        # buffers by row parity does not fix it.
+        #
+        # What works is the same trick the consistency-check gate uses for counters:
+        # compare the MONOTONIC ENVELOPE (running max) of each clock rather than the
+        # instantaneous values. That collapses the spread 29 s -> 4.5 s. The residual is
+        # a sawtooth whose amplitude is the CFE_TIME arrival period (~4 s at 0.25 /s),
+        # because the MET envelope only steps on a CFE_TIME message while GPS updates
+        # 3.6x/s. Threshold is 2x that floor.
+        #
+        # ⚠ The FSW clock is MET + STCF, NOT MET alone. A live SET_TIME (0x1805 FC7)
+        # was observed moving STCF 0 -> 199,999,092 while MET kept free-running — so a
+        # MET-only rule watches the wrong field and misses the very attack it targets.
+        # This is what SET_TIME does in cFE: it adjusts STCF so current time = commanded
+        # time, leaving the free-running MET untouched. SET_MET moves MET instead, and a
+        # GPS spoof moves GPS; summing MET+STCF and enveloping vs GPS catches all three.
+        #
+        # Detects a jump of >=10 s in EITHER direction: forward moves one envelope,
+        # backward freezes it while the other advances. Jumps <=5 s sit inside the
+        # sawtooth and are invisible — an accepted limit, since the SET_TIME attacks
+        # this targets set arbitrary (large) times.
+        "TimeDivergenceGpsFields": "NOVATEL.Novatel_oem615.Weeks,"
+                                   "NOVATEL.Novatel_oem615.SecondsIntoWeek,"
+                                   "NOVATEL.Novatel_oem615.Fractions",
+        "TimeDivergenceMetFields": "CFE_TIME.SecondsMET,CFE_TIME.SubsecsMET,"
+                                   "CFE_TIME.SecondsSTCF,CFE_TIME.SubsecsSTCF",
+        "TimeDivergenceThreshold": "9.0",
+        # ⚠ A running max LATCHES any single spurious high sample forever. Measured on
+        # a nominal soak: 2 of 3344 NOVATEL frames carried a torn read
+        # (Weeks 341 -> 43387, SecondsIntoWeek 150240 -> 731), which pushed the GPS
+        # envelope 26 BILLION seconds high and pinned R15 on for 2420 consecutive
+        # frames. Two earlier 0-FP windows (963 and 2273 frames) never hit one.
+        # Fix: feed the envelope a MEDIAN over the last N raw samples instead of the
+        # raw value. An isolated torn read is rejected outright; a real time shift is
+        # sustained, so it passes through after ceil(N/2) frames — negligible against
+        # the 8-frame CmdDwell. N must be odd.
+        "TimeDivergenceMedianFrames": "5",
         # R10 bus-sweep meta-rule: LM-0002 sweeps every reachable MID, tripping several
         # static-in-nominal command counters (R6/R7/R8/R9) in the same short window. No
         # single technique does that, so when this many DISTINCT command rules are firing
@@ -403,6 +452,22 @@ class Plugin(AIPlugin):
         self._modestate_idx = {f.strip(): idx[f.strip()]
                                for f in mode_cfg.split(",")
                                if f.strip() and f.strip() in idx}
+        # R15 gps-time-divergence: both clocks, resolved to column indices. The rule
+        # is registered only when EVERY field is present, since a partial set cannot
+        # reconstruct either clock.
+        gps_f = [f.strip() for f in cfg.get(
+            "timedivergencegpsfields", self.DEFAULTS["TimeDivergenceGpsFields"]).split(",")
+            if f.strip()]
+        met_f = [f.strip() for f in cfg.get(
+            "timedivergencemetfields", self.DEFAULTS["TimeDivergenceMetFields"]).split(",")
+            if f.strip()]
+        self._td_gps_idx = ([idx[f] for f in gps_f] if all(f in idx for f in gps_f)
+                            else None)
+        self._td_met_idx = ([idx[f] for f in met_f] if all(f in idx for f in met_f)
+                            else None)
+        self._td_threshold = float(cfg.get("timedivergencethreshold",
+                                           self.DEFAULTS["TimeDivergenceThreshold"]))
+        self._td_median_n = max(1, _int("TimeDivergenceMedianFrames") | 1)  # force odd
         self._mode_debounce = _int("ModeDebounceFrames")
         self._mode_flap_window = _int("ModeFlapWindowFrames")
         self._mode_flap_min = _int("ModeFlapMinTransitions")
@@ -424,6 +489,8 @@ class Plugin(AIPlugin):
             self._rule_ids.add(rid)
         if self._routestate_idx:
             self._rule_ids.add("R13:to-route")
+        if self._td_gps_idx and self._td_met_idx:
+            self._rule_ids.add("R15:gps-time-divergence")
         if self._modestate_idx:
             self._rule_ids.add("R14:adcs-mode")
             self._rule_ids.add("R14:adcs-mode-flap")
@@ -444,6 +511,14 @@ class Plugin(AIPlugin):
         # R14 mode-state: the confirmed-stable mode, plus the debounce candidate and
         # its run length. `_mode_dwell` holds the fire long enough for the leaky
         # integrator to latch one bounded incident (same trick as R6-R13's CmdDwell).
+        # R15: monotonic envelopes of each clock, and the divergence baseline taken
+        # once warmup has seen at least one full sawtooth cycle.
+        self._td_gmax = None
+        self._td_mmax = None
+        self._td_gbuf = []          # raw GPS samples awaiting the median filter
+        self._td_mbuf = []          # raw FSW-clock samples
+        self._td_baseline = None
+        self._td_dwell = 0
         self._mode_stable = {f: None for f in self._modestate_idx}
         self._mode_cand = {f: None for f in self._modestate_idx}
         self._mode_cand_n = {f: 0 for f in self._modestate_idx}
@@ -581,6 +656,53 @@ class Plugin(AIPlugin):
                 self._routestate_baseline[f] = v
             elif v != self._routestate_baseline[f]:
                 fired.add("R13:to-route")
+        # R15 gps-time-divergence (AINOS3-95): compare the MONOTONIC ENVELOPE of the
+        # GPS clock against that of the flight-software clock. Both raw series are
+        # double-buffer corrupted (see the config note), so instantaneous differencing
+        # is unusable; running maxima are not. A jump in either direction moves the
+        # divergence off its session baseline — forward pushes the GPS envelope up,
+        # backward freezes it while MET keeps climbing.
+        if self._td_gps_idx and self._td_met_idx:
+            gv = [val(i) for i in self._td_gps_idx]
+            mv = [val(i) for i in self._td_met_idx]
+            gps = met = None          # unbound-safe: the checks below may not assign
+            # weeks == 0 means the receiver has not yet acquired; treat as no data
+            # rather than as a clock at the GPS epoch.
+            if all(x is not None for x in gv + mv) and gv[0] > 0:
+                gps = gv[0] * 604800.0 + gv[1] + gv[2]
+                # FSW clock = MET + STCF. The met field list is (secs, subsecs) pairs,
+                # so this handles both a MET-only (2-field) and a MET+STCF (4-field)
+                # configuration without special-casing.
+                met = sum(mv[i] + mv[i + 1] / 4294967296.0
+                          for i in range(0, len(mv), 2))
+                # Median-filter BOTH clocks before the envelope sees them, so a torn
+                # read cannot latch the running max (see the config note).
+                self._td_gbuf.append(gps)
+                self._td_mbuf.append(met)
+                if len(self._td_gbuf) > self._td_median_n:
+                    self._td_gbuf.pop(0)
+                    self._td_mbuf.pop(0)
+                if len(self._td_gbuf) < self._td_median_n:
+                    gps = met = None
+                else:
+                    gps = sorted(self._td_gbuf)[self._td_median_n // 2]
+                    met = sorted(self._td_mbuf)[self._td_median_n // 2]
+            if gps is not None and met is not None:
+                self._td_gmax = gps if self._td_gmax is None else max(self._td_gmax, gps)
+                self._td_mmax = met if self._td_mmax is None else max(self._td_mmax, met)
+                div = self._td_gmax - self._td_mmax
+                if in_warmup:
+                    # Track the warmup maximum so the baseline sits at the top of the
+                    # sawtooth rather than wherever the last warmup frame happened to
+                    # land — otherwise up to a full sawtooth of headroom is lost.
+                    self._td_baseline = (div if self._td_baseline is None
+                                         else max(self._td_baseline, div))
+                elif self._td_baseline is not None:
+                    if abs(div - self._td_baseline) > self._td_threshold:
+                        self._td_dwell = self._cmd_dwell_frames
+        if self._td_dwell > 0:
+            fired.add("R15:gps-time-divergence")
+            self._td_dwell -= 1
         # R14 mode-state (AINOS3-77): a CONFIRMED ADCS flight-mode transition = a forced
         # SET_MODE (DE-0005). The IF cannot see this — the per-mode router re-arms a
         # 250-frame warmup on every mode change, suppressing dynamics detection exactly

@@ -4,7 +4,8 @@ import pytest
 
 import sys
 # onair package importable from fsw/ (conftest adds it); AIPlugin is a plain base.
-from plugins.rule_gate.rule_gate_plugin import Plugin, _to_num, _device_label
+from plugins.rule_gate.rule_gate_plugin import (Plugin, _to_num, _device_label,
+                                                _incident_label)
 
 # A real ini that disables file output, so construction never touches the
 # runtime-relative ../../../../data dir (unwritable from the pytest cwd). The
@@ -824,3 +825,163 @@ def test_r14_flap_label_distinguishes_from_single_force():
 def test_r14_flap_not_registered_without_the_mode_field():
     p = _mk(H)
     assert "R14:adcs-mode-flap" not in p._rule_ids
+
+
+# ---------------------------------------------------------------------------
+# R15 gps-time-divergence (AINOS3-95)
+#
+# The rule compares the MONOTONIC ENVELOPE of the GPS clock against that of the
+# flight-software clock. Instantaneous differencing is unusable: measured on a
+# clean stack the raw per-frame divergence has a 29 s spread because OnAIR's
+# double buffer corrupts both operands (GPS steps backward, MET oscillates
+# between two values ~4 s apart). Running maxima collapse that to 4.5 s.
+# ---------------------------------------------------------------------------
+
+HTD = ["IMU.DeviceEnabled", "CFE_EVS_HK.MessageSendCounter",
+       "CFE_SB.MsgSendErrorCounter", "ADCS_HK.CommandErrorCount",
+       "NOVATEL.Novatel_oem615.Weeks", "NOVATEL.Novatel_oem615.SecondsIntoWeek",
+       "NOVATEL.Novatel_oem615.Fractions",
+       "CFE_TIME.SecondsMET", "CFE_TIME.SubsecsMET",
+       "CFE_TIME.SecondsSTCF", "CFE_TIME.SubsecsSTCF"]
+
+_WEEK = 604800.0
+
+
+def _feed_td(p, gps_s, met_s, weeks=341, stcf_s=0.0):
+    """One frame. FSW clock = MET + STCF; a SET_TIME attack moves STCF, a SET_MET
+    attack moves MET, a GPS spoof moves the GPS second-into-week."""
+    _feed(p, HTD, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": "131",
+                   "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0",
+                   "NOVATEL.Novatel_oem615.Weeks": str(weeks),
+                   "NOVATEL.Novatel_oem615.SecondsIntoWeek": str(gps_s),
+                   "NOVATEL.Novatel_oem615.Fractions": "0.0",
+                   "CFE_TIME.SecondsMET": str(met_s), "CFE_TIME.SubsecsMET": "0",
+                   "CFE_TIME.SecondsSTCF": str(stcf_s), "CFE_TIME.SubsecsSTCF": "0"})
+
+
+def _warmup_td(p, n=31, gps0=150240.0, met0=21.0):
+    """Nominal: both clocks advance together at ~1 s per frame."""
+    for k in range(n):
+        _feed_td(p, gps0 + k, met0 + k)
+    return gps0 + n - 1, met0 + n - 1
+
+
+def test_r15_registered_when_both_clocks_present():
+    p = _mk(HTD)
+    assert "R15:gps-time-divergence" in p._rule_ids
+
+
+def test_r15_not_registered_without_the_gps_fields():
+    p = _mk(HRT)                     # no NOVATEL / CFE_TIME columns
+    assert "R15:gps-time-divergence" not in p._rule_ids
+
+
+def test_r15_nominal_never_fires():
+    """Both clocks advancing 1:1 is the nominal case and must stay silent."""
+    p = _mk(HTD)
+    g, m = _warmup_td(p)
+    for k in range(1, 60):
+        _feed_td(p, g + k, m + k)
+    assert "R15:gps-time-divergence" not in p._latest_active
+
+
+def test_r15_ignores_unacquired_receiver():
+    """Weeks == 0 is 'no GPS fix yet', not a clock sitting at the GPS epoch.
+    Treating it as real would make the envelope diverge by ~206 million s."""
+    p = _mk(HTD)
+    for _ in range(40):
+        _feed_td(p, 0.0, 21.0, weeks=0)
+    assert p._td_gmax is None
+    assert "R15:gps-time-divergence" not in p._latest_active
+
+
+def test_r15_detects_a_forward_time_jump():
+    """A SET_TIME / spoof pushing GPS forward moves the GPS envelope off the
+    baseline (EX-0014.01 / EX-0012.12)."""
+    p = _mk(HTD)
+    g, m = _warmup_td(p)
+    for k in range(1, 6):
+        _feed_td(p, g + k + 30.0, m + k)          # +30 s spoof
+    assert "R15:gps-time-divergence" in p._latest_active
+
+
+def test_r15_detects_a_live_set_time_via_stcf():
+    """The path a real SET_TIME (0x1805 FC7) exercises, and the one the first
+    version of this rule MISSED: cFE SET_TIME moves STCF, not the free-running
+    MET. Confirmed live 2026-08-25 — STCF jumped 0 -> 199,999,092 while MET kept
+    counting. The FSW clock is MET + STCF, so enveloping their sum catches it."""
+    p = _mk(HTD)
+    g, m = _warmup_td(p)                        # STCF = 0 throughout warmup
+    for k in range(1, 6):
+        _feed_td(p, g + k, m + k, stcf_s=30.0)  # SET_TIME shifts STCF by +30 s
+    assert "R15:gps-time-divergence" in p._latest_active
+
+
+def test_r15_detects_a_backward_time_jump():
+    """Backward is detectable too, by a different mechanism: the GPS envelope
+    FREEZES while the MET envelope keeps advancing, so the divergence shrinks."""
+    p = _mk(HTD)
+    g, m = _warmup_td(p)
+    for k in range(1, 40):
+        _feed_td(p, g - 60.0 + k, m + k)          # -60 s spoof, then resume
+    assert "R15:gps-time-divergence" in p._latest_active
+
+
+def test_r15_tolerates_double_buffer_flicker():
+    """The measured pathology: GPS stepping BACKWARD one second and MET
+    oscillating ~4 s between adjacent frames. Neither is an attack, and the
+    running-max envelope must absorb both."""
+    p = _mk(HTD)
+    g, m = _warmup_td(p)
+    for k in range(1, 60):
+        back = -1.0 if k % 3 == 0 else 0.0        # GPS flicker backward
+        stale = -4.0 if k % 2 == 0 else 0.0       # MET oscillation
+        _feed_td(p, g + k + back, m + k + stale)
+    assert "R15:gps-time-divergence" not in p._latest_active
+
+
+def test_r15_small_jump_below_the_sawtooth_is_not_claimed():
+    """Honest limit: a jump inside the ~4.5 s sawtooth floor is invisible. The
+    test pins the limitation so it cannot be quietly overstated later."""
+    p = _mk(HTD)
+    g, m = _warmup_td(p)
+    for k in range(1, 20):
+        _feed_td(p, g + k + 5.0, m + k)           # +5 s, under the 9 s threshold
+    assert "R15:gps-time-divergence" not in p._latest_active
+
+
+def test_r15_emits_ex0014_01_incident():
+    p = _mk(HTD)
+    g, m = _warmup_td(p)
+    for k in range(1, 6):
+        _feed_td(p, g + k + 30.0, m + k)
+    cluster, sub = _incident_label(["R15:gps-time-divergence"])
+    assert cluster == "EX-0014.01"
+    assert sub == "gps-met-divergence"
+
+
+def test_r15_rejects_an_isolated_torn_read():
+    """The nominal-soak false positive (2026-08-25): 2 of 3344 NOVATEL frames
+    carried a torn read — Weeks 341 -> 43387, SecondsIntoWeek 150240 -> 731.
+    A raw running max LATCHED that garbage and pinned R15 on for 2420 frames.
+    The median pre-filter must reject an isolated spurious sample outright."""
+    p = _mk(HTD)
+    g, m = _warmup_td(p)
+    for k in range(1, 60):
+        if k == 20:                                  # single torn frame
+            _feed_td(p, 731.0, m + k, weeks=43387)
+        else:
+            _feed_td(p, g + k, m + k)
+    assert "R15:gps-time-divergence" not in p._latest_active
+
+
+def test_r15_survives_frames_with_no_gps_fix():
+    """Weeks == 0 frames must not crash the rule or corrupt the filter — the
+    envelope block runs every frame, including ones with no usable clock."""
+    p = _mk(HTD)
+    g, m = _warmup_td(p)
+    for k in range(1, 30):
+        _feed_td(p, 0.0, m + k, weeks=0)             # no fix
+    for k in range(30, 60):
+        _feed_td(p, g + k, m + k)                    # fix returns, nominal
+    assert "R15:gps-time-divergence" not in p._latest_active
