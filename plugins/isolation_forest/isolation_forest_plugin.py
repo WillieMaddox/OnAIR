@@ -123,6 +123,13 @@ class Plugin(AIPlugin):
         # to OnAIR cwd (fsw/build/exe/cpu1) at runtime.
         "SideFileOutputDir": "../../../../data/onair/csv",
         "SideFileFlushEvery": "10",  # rows buffered before each fsync-less append
+        # AINOS3-121: golden-frame capture for the offline IF-audit harness.
+        # When >0, every Nth frame the EXACT feature vector the model scored is
+        # saved (with score + scenario) to an .npz, so an offline decision_function
+        # can be checked against the live score and used for per-feature positive
+        # controls. 0 = off (production default).
+        "GoldenCaptureEvery": "0",
+        "GoldenCaptureMax": "60",
         # Startup-transient suppression. Training uses --skip-warmup-rows 30
         # because the first ~30 frames after OnAIR connects have not-yet-
         # arrived MIDs (placeholder values + huge first-arrival deltas) that
@@ -402,6 +409,22 @@ class Plugin(AIPlugin):
                 side_dir, f"iforest_out_{ts}_pid{os.getpid()}.csv"
             )
 
+        # AINOS3-121 golden capture
+        self._golden_every = int(cfg.get("goldencaptureevery",
+                                         self.DEFAULTS["GoldenCaptureEvery"]))
+        self._golden_max = int(cfg.get("goldencapturemax",
+                                       self.DEFAULTS["GoldenCaptureMax"]))
+        self._golden_rows: list[tuple] = []
+        self._golden_path: str | None = None
+        if self._golden_every > 0:
+            side_dir = cfg.get("sidefileoutputdir", self.DEFAULTS["SideFileOutputDir"])
+            os.makedirs(side_dir, exist_ok=True)
+            gts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
+            self._golden_path = os.path.join(
+                side_dir, f"iforest_golden_{gts}_pid{os.getpid()}.npz")
+            print(f"[iforest][golden] capturing every {self._golden_every} frames "
+                  f"(max {self._golden_max}) -> {self._golden_path}")
+
         print(f"[iforest] threshold={self.threshold:+.4f} "
               f"(score < threshold ⇒ anomaly), n_raw_features={self.n_raw}, "
               f"heartbeat every {self._heartbeat_every} frames")
@@ -674,6 +697,17 @@ class Plugin(AIPlugin):
             if len(self._side_file_buffer) >= self._side_file_flush_every:
                 self._flush_side_file()
 
+        # AINOS3-121: capture the exact scored feature vector for offline replay.
+        if (self._golden_every > 0 and len(self._golden_rows) < self._golden_max
+                and self._frame_count % self._golden_every == 0):
+            self._golden_rows.append(
+                (self._frame_count - 1, self.scenario, score, self.threshold,
+                 int(is_anomaly), features.astype(np.float64).copy()))
+            # flush incrementally (savez overwrites) so the file is always current,
+            # e.g. while cycling modes; and once more on reaching the cap.
+            if len(self._golden_rows) % 20 == 0 or len(self._golden_rows) >= self._golden_max:
+                self._save_golden()
+
         if self._recal_enabled:
             self._recal_scores.append(score)
             self._recal_alert_in_window.append(self._alert_active)
@@ -683,6 +717,27 @@ class Plugin(AIPlugin):
                     and len(self._recal_scores) >= self._recal_window):
                 self._try_recalibrate()
                 self._recal_frames_since = 0
+
+    def _save_golden(self) -> None:
+        """Persist captured golden frames (feature vector + score) to .npz for the
+        AINOS3-121 offline audit. feature_names gives the column->feature mapping."""
+        if not self._golden_rows or self._golden_path is None:
+            return
+        try:
+            np.savez(
+                self._golden_path,
+                frame_idx=np.array([r[0] for r in self._golden_rows], dtype=np.int64),
+                scenario=np.array([r[1] for r in self._golden_rows]),
+                score=np.array([r[2] for r in self._golden_rows], dtype=np.float64),
+                threshold=np.array([r[3] for r in self._golden_rows], dtype=np.float64),
+                is_anomaly=np.array([r[4] for r in self._golden_rows], dtype=np.int64),
+                features=np.vstack([r[5] for r in self._golden_rows]),
+                feature_names=np.array(self.schema["feature_names"]),
+            )
+            print(f"[iforest][golden] saved {len(self._golden_rows)} frames "
+                  f"-> {self._golden_path}")
+        except Exception as e:  # never let capture break scoring
+            print(f"[iforest][golden] save failed: {e}")
 
     def _try_recalibrate(self) -> None:
         """Recompute the threshold from the rolling nominal window, if safe.
