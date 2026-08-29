@@ -79,7 +79,7 @@ the IF's high_level_data) and fires on:
                       static-in-nominal new-high + dwell mechanism as R6-R11.
   R13 to-route      : TO.usEnabledRoutes / TO.usConfigRoutes (the downlink route masks)
                       leave their nominal baseline — the downlink routing/destination was
-                      reconfigured (EXF-0003.02 exfil / IMP-0006 theft). A specific
+                      reconfigured (EXF-0003.02 exfil — telemetry theft). A specific
                       corroborator of R12: fires on a route enable/disable/add; a
                       same-destination redirect that leaves the mask unchanged is still
                       caught by R12's command-counter increment. Baseline-deviation +
@@ -156,7 +156,7 @@ _TECH_LABEL = {
     "R10:bus-sweep": "Bus sweep — many MIDs commanded in one window (LM-0002 lack of bus segregation)",
     "R11:fm-command": "File Manager command — file-operation burst (EX-0010.01 ransomware / EX-0010.02 wiper)",
     "R12:to-command": "Telemetry Output command — downlink reconfigure (EXF-0003.02 downlink exfiltration)",
-    "R13:to-route": "Downlink route mask changed — downlink reconfigured (EXF-0003.02 exfil / IMP-0006 theft)",
+    "R13:to-route": "Downlink route mask changed — downlink reconfigured (EXF-0003.02 exfil — telemetry theft)",
     "R16:cf-command": "CFDP command — file transfer initiated or reconfigured "
                       "(EX-0010 file-op burst / EXF-0003.02 exfiltration)",
     "R16:cf-fault": "CFDP file-operation faults — files failing to open, read or "
