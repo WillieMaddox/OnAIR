@@ -1091,3 +1091,56 @@ def test_r16_command_alone_labels_exfiltration():
     cluster, sub = _incident_label(["R16:cf-command"])
     assert cluster == "EXF-0003.02"
     assert sub == "cfdp-transfer-command"
+
+
+# ---------------------------------------------------------------------------
+# R17 eps-command: header includes EPS.CommandCount (static at 0 in nominal —
+# the EPS receives no commands in flight; AINOS3-87). A new high = an injected
+# EPS command, i.e. the EX-0012.09 power-switch toggle.
+# ---------------------------------------------------------------------------
+HEPS = ["IMU.DeviceEnabled", "CFE_EVS_HK.MessageSendCounter",
+        "CFE_SB.MsgSendErrorCounter", "ADCS_HK.CommandErrorCount",
+        "EPS.CommandCount", "ADCS_GNC.Mode"]
+
+def _feed_eps(p, cc, mode="2"):
+    _feed(p, HEPS, {"IMU.DeviceEnabled": "1", "CFE_EVS_HK.MessageSendCounter": "131",
+                    "CFE_SB.MsgSendErrorCounter": "0", "ADCS_HK.CommandErrorCount": "0",
+                    "EPS.CommandCount": str(cc), "ADCS_GNC.Mode": mode})
+
+def _warmup_eps(p, cc=0):
+    for _ in range(31):
+        _feed_eps(p, cc)
+
+
+def test_r17_eps_command_latches():
+    p = _mk(HEPS)
+    _warmup_eps(p, cc=0)                          # baseline EPS.CommandCount = 0 (nominal)
+    _feed_eps(p, 1)                              # EX-0012.09 switch toggle: 0->1 new high
+    for _ in range(4):
+        _feed_eps(p, 1)
+    assert "R17:eps-command" in p._latest_active
+
+
+def test_r17_static_never_fires():
+    p = _mk(HEPS)
+    _warmup_eps(p, cc=0)
+    for _ in range(10):
+        _feed_eps(p, 0)                          # no EPS command -> counter static
+    assert "R17:eps-command" not in p._latest_active
+
+
+def test_r17_double_buffer_flicker_single_toggle():
+    # OnAIR's double buffer flickers the fresh value with the stale one; the running
+    # max must ignore the flicker back to baseline and keep the alert up.
+    p = _mk(HEPS)
+    _warmup_eps(p, cc=0)
+    for _ in range(6):
+        _feed_eps(p, 1)                          # fresh buffer: switch ON (count -> 1)
+        _feed_eps(p, 0)                          # stale buffer flickers back to baseline
+    assert "R17:eps-command" in p._latest_active
+
+
+def test_r17_labels_ex0012_09():
+    cluster, sub = _incident_label(["R17:eps-command"])
+    assert cluster == "EX-0012.09"
+    assert sub == "eps-command"

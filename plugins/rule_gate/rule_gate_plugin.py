@@ -84,6 +84,15 @@ the IF's high_level_data) and fires on:
                       same-destination redirect that leaves the mask unchanged is still
                       caught by R12's command-counter increment. Baseline-deviation +
                       leaky-integrator flicker tolerance, same as R5 monitor-state.
+  R17 eps-command   : EPS.CommandCount reaches a new high — a GENERIC_EPS command
+                      (0x191A). NOS3's EPS receives NO commands in nominal (static at 0
+                      across a 22 h soak and a live baseline), so any increment is an
+                      injected command: the EX-0012.09 power-switch toggle (unauthorized
+                      bus energize). Same static-in-nominal new-high + dwell mechanism as
+                      R6-R12. The dynamics-IF is structurally blind here — a discrete
+                      switch state change moves no consumption feature, because the EPS
+                      schema carries none (bus voltages only) — so this rule is the sole
+                      detector for it. (AINOS3-87.)
   R14 adcs-mode     : ADCS_GNC.Mode moved to a different flight mode — a forced
                       GENERIC_ADCS SET_MODE (0x1940 FC2), the DE-0005 safe-mode-
                       subversion step. This is a pure IF BLIND SPOT: a mode force
@@ -157,6 +166,7 @@ _TECH_LABEL = {
     "R11:fm-command": "File Manager command — file-operation burst (EX-0010.01 ransomware / EX-0010.02 wiper)",
     "R12:to-command": "Telemetry Output command — downlink reconfigure (EXF-0003.02 downlink exfiltration)",
     "R13:to-route": "Downlink route mask changed — downlink reconfigured (EXF-0003.02 exfil — telemetry theft)",
+    "R17:eps-command": "EPS command — unauthorized power-switch toggle / bus energize (EX-0012.09 modify power distribution)",
     "R16:cf-command": "CFDP command — file transfer initiated or reconfigured "
                       "(EX-0010 file-op burst / EXF-0003.02 exfiltration)",
     "R16:cf-fault": "CFDP file-operation faults — files failing to open, read or "
@@ -233,7 +243,7 @@ def _incident_label(active_rules):
         if r == "R16:cf-fault":
             return 2.4
         return {"R1": 0, "R10": 1, "R5": 2, "R13": 2, "R16": 2.5, "R14": 2.5, "R6": 3, "R7": 3,
-                "R8": 3, "R9": 3, "R11": 3, "R12": 3, "R2": 4, "R4": 5, "R3": 6}.get(
+                "R8": 3, "R9": 3, "R11": 3, "R12": 3, "R17": 3, "R2": 4, "R4": 5, "R3": 6}.get(
                     r.split(":", 1)[0], 7)
     if not active_rules:
         return "", ""
@@ -261,6 +271,8 @@ def _incident_label(active_rules):
         return "EX-0010", "fm-command"
     if r == "R12:to-command":
         return "EXF-0003.02", "to-command"
+    if r == "R17:eps-command":
+        return "EX-0012.09", "eps-command"
     if r == "R13:to-route":
         return "EXF-0003.02", "to-route"
     if r == "R14:adcs-mode-flap":
@@ -443,7 +455,8 @@ class Plugin(AIPlugin):
                            ("CFE_TBL.CommandCounter", "R9:tbl-command"),
                            ("FM.CommandCounter", "R11:fm-command"),
                            ("TO.usCmdCnt", "R12:to-command"),
-                           ("CF.counters.cmd", "R16:cf-command")):
+                           ("CF.counters.cmd", "R16:cf-command"),
+                           ("EPS.CommandCount", "R17:eps-command")):
             if field in idx:
                 self._cmd_rule[idx[field]] = rid
         # R16 cf-fault (AINOS3-103): the CFDP per-channel file-operation fault counters.
