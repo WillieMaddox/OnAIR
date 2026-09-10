@@ -229,3 +229,66 @@ def test_ini_overrides_defaults(monkeypatch, tmp_path):
     assert csv_out.lines_per_file == 7
     assert csv_out.write_header_on_rotation is False
     assert csv_out.exclude_columns == {'foo', 'bar', 'baz'}
+
+
+# ── AINOS3-124: the recorded-schema fingerprint ───────────────────────────────
+# `schema_sha256` hashes the tlm metadata FILE and so does not move when the
+# prune moves. A prune IS a schema change to every downstream consumer, so the
+# sidecar also carries a hash over the columns as actually recorded.
+
+def _sidecar_of(csv_out):
+    import json
+    return json.loads(open(csv_out.file_name[:-4] + '.meta.json').read())
+
+
+def test_recorded_schema_sha256_present_and_hashes_kept_columns(isolated_outdir):
+    import hashlib
+
+    csv_out = CSV_Output(MagicMock(), ['h1', 'drop', 'h2'])
+    csv_out.exclude_columns = {'drop'}
+    csv_out.update(['a', 'b', 'c'], {})
+    csv_out.render_reasoning()
+
+    meta = _sidecar_of(csv_out)
+    expected = hashlib.sha256('h1\nh2'.encode('utf-8')).hexdigest()
+    assert meta['recorded_schema_sha256'] == expected
+
+
+def test_recorded_schema_sha256_changes_when_the_prune_changes(isolated_outdir):
+    """The defect this fixes: schema_sha256 alone cannot see a prune change."""
+    a = CSV_Output(MagicMock(), ['h1', 'h2', 'h3'])
+    a.update(['1', '2', '3'], {})
+    a.render_reasoning()
+
+    b = CSV_Output(MagicMock(), ['h1', 'h2', 'h3'])
+    b.exclude_columns = {'h2'}
+    b.update(['1', '2', '3'], {})
+    b.render_reasoning()
+
+    ma, mb = _sidecar_of(a), _sidecar_of(b)
+    assert ma['schema_sha256'] == mb['schema_sha256']  # unchanged - the defect
+    assert ma['recorded_schema_sha256'] != mb['recorded_schema_sha256']
+
+
+def test_recorded_schema_sha256_is_order_sensitive(isolated_outdir):
+    a = CSV_Output(MagicMock(), ['h1', 'h2'])
+    a.update(['1', '2'], {})
+    a.render_reasoning()
+
+    b = CSV_Output(MagicMock(), ['h2', 'h1'])
+    b.update(['2', '1'], {})
+    b.render_reasoning()
+
+    assert _sidecar_of(a)['recorded_schema_sha256'] != _sidecar_of(b)['recorded_schema_sha256']
+
+
+def test_recorded_schema_sha256_stable_across_two_identical_sessions(isolated_outdir):
+    a = CSV_Output(MagicMock(), ['h1', 'h2'])
+    a.update(['1', '2'], {})
+    a.render_reasoning()
+
+    b = CSV_Output(MagicMock(), ['h1', 'h2'])
+    b.update(['9', '9'], {})
+    b.render_reasoning()
+
+    assert _sidecar_of(a)['recorded_schema_sha256'] == _sidecar_of(b)['recorded_schema_sha256']

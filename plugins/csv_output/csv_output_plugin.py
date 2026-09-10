@@ -17,7 +17,7 @@ from datetime import datetime
 from onair.src.ai_components.ai_plugin_abstract.ai_plugin import AIPlugin
 
 
-PLUGIN_VERSION = "csv_output@1.1"
+PLUGIN_VERSION = "csv_output@1.2"
 
 
 def _stringify(value):
@@ -55,9 +55,19 @@ class Plugin(AIPlugin):
     struct definitions.
 
     A sidecar `<filename>.meta.json` is written at file creation recording
-    session ID, schema fingerprint (sha256 of the active tlm metadata
-    file), plugin version, container hostname, pid, and the exclusion
-    list. Loaders can use this to verify schema consistency across files.
+    session ID, two schema fingerprints, plugin version, container hostname,
+    pid, and the exclusion list. Loaders can use this to verify schema
+    consistency across files.
+
+    The two fingerprints are NOT interchangeable (AINOS3-124):
+      * `schema_sha256`          - sha256 of the active tlm metadata FILE.
+        Changes on any edit to that file, including comment/ordering churn
+        that does not move a column, and does NOT change when the ini's
+        ExcludeColumns changes. It fingerprints the SUBSCRIBED schema.
+      * `recorded_schema_sha256` - sha256 over the ordered list of columns
+        actually written to this CSV (post-prune). This is the RECORDED
+        schema: it is what a corpus is trained against, and it is the value
+        a corpus manifest should pin.
     """
 
     DEFAULTS = {
@@ -137,6 +147,22 @@ class Plugin(AIPlugin):
             'plugin_version': PLUGIN_VERSION,
         }
 
+    def _recorded_schema_sha256(self):
+        """sha256 over the ordered column list actually written to the CSV.
+
+        Why this exists alongside `schema_sha256` (AINOS3-124): that one hashes
+        the tlm metadata FILE, so it moves on comment churn and — the defect this
+        fixes — does NOT move when ExcludeColumns changes. A prune is a real
+        schema change to every downstream consumer, so the freeze and the corpus
+        manifest need a fingerprint over the columns as recorded.
+
+        Newline-joined so a column rename cannot collide with a reordering.
+        """
+        if self.filtered_headers is None:
+            return None
+        payload = '\n'.join(self.filtered_headers).encode('utf-8')
+        return hashlib.sha256(payload).hexdigest()
+
     def _make_filename(self):
         # Microsecond precision so a rapid rotation cycle (e.g. small
         # LinesPerFile in tests, or a high-throughput scenario) cannot
@@ -156,6 +182,7 @@ class Plugin(AIPlugin):
             'excluded_columns': sorted(self.exclude_columns),
             'kept_columns_count': len(self.filtered_headers),
             'kept_columns': list(self.filtered_headers),
+            'recorded_schema_sha256': self._recorded_schema_sha256(),
         }
         meta.update(self._meta_extras)
         meta_path = self.file_name[:-4] + '.meta.json' if self.file_name.endswith('.csv') \
