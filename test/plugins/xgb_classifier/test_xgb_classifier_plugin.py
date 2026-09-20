@@ -207,7 +207,7 @@ def test_if_above_threshold_runs_classifier_emits_top_k(configured, tmp_path):
     r = plugin.render_reasoning()
     assert r["is_anomaly"] is True
     assert r["predicted_class"] == "EX-0012.04"  # 0.70 wins
-    # NOS3-202: with no taxonomy loaded, the cluster maps to the class itself.
+    # AINOS3-26: with no taxonomy loaded, the cluster maps to the class itself.
     assert r["predicted_cluster"] == "EX-0012.04"
     assert r["predicted_confidence"] == pytest.approx(0.70)
     assert [c for c, _ in r["predictions"]] == ["EX-0012.04", "EX-0001.01",
@@ -216,7 +216,7 @@ def test_if_above_threshold_runs_classifier_emits_top_k(configured, tmp_path):
     _, rows = _read_side_file(tmp_path)
     data = rows[1]
     # frame_idx=0, mode=MODE_SUNSAFE, if_anomaly=1, predicted=EX-0012.04,
-    # predicted_cluster (NOS3-202 column 5), then top-K pairs from column 6.
+    # predicted_cluster (AINOS3-26 column 5), then top-K pairs from column 6.
     assert data[3] == "1"
     assert data[4] == "EX-0012.04"     # predicted_class
     assert data[5] == "EX-0012.04"     # predicted_cluster (self-map, no taxonomy)

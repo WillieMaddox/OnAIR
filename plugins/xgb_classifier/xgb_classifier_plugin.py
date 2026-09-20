@@ -61,7 +61,7 @@ from typing import Any
 
 import numpy as np
 
-# The incident aggregator (NOS3-201) ships in this plugin package; make the
+# The incident aggregator (AINOS3-25) ships in this plugin package; make the
 # package dir importable regardless of how OnAIR loads the plugin file.
 import sys as _sys
 _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -133,13 +133,13 @@ class Plugin(AIPlugin):
         # first N frames before SBN subscriptions are fully populated.
         "WarmupFrames": "30",
         "HeartbeatEvery": "100",
-        # ─── NOS3-202: cluster reporting ─────────────────────────────
+        # ─── AINOS3-26: cluster reporting ─────────────────────────────
         # Telemetry-indistinguishable sub-techniques are reported as a single
         # cluster (e.g. "EX-0012.{03,04,05}"). Empty ⇒ derive from the
         # classifier path's sibling cluster_rescore dir; missing file ⇒ each
         # class is its own cluster (no behavioural change).
         "ClusterTaxonomyPath": "",
-        # ─── NOS3-201: incident aggregation ──────────────────────────
+        # ─── AINOS3-25: incident aggregation ──────────────────────────
         "WriteIncidentFile": "true",
         # Hysteresis for incident open/close. Mirrors the IF plugin's
         # alert/clear hysteresis so an incident == one operational alert.
@@ -196,7 +196,7 @@ class Plugin(AIPlugin):
         if cal_min_conf is not None:
             self.min_confidence = cal_min_conf
 
-        # ─── NOS3-202: cluster taxonomy ───────────────────────────────
+        # ─── AINOS3-26: cluster taxonomy ───────────────────────────────
         # Map each sub-technique to its telemetry-indistinguishable cluster.
         # Unknown / unclustered classes map to themselves.
         tax_path = cfg.get("clustertaxonomypath",
@@ -344,7 +344,7 @@ class Plugin(AIPlugin):
             self._side_file_path = os.path.join(
                 side_dir, f"attack_class_{ts}_pid{os.getpid()}.csv")
 
-        # ─── NOS3-201: incident aggregator + incident side-file ───────
+        # ─── AINOS3-25: incident aggregator + incident side-file ───────
         self._incident_agg = IncidentAggregator(
             alert_hysteresis=int(cfg.get("alerthysteresis",
                                          self.DEFAULTS["AlertHysteresis"])),
@@ -543,7 +543,7 @@ class Plugin(AIPlugin):
         # AINOS3-37: per-mode calibration so the confidence is comparable across
         # heads. Monotone → argmax (top1_class) unchanged; only the number moves.
         top1_prob = self._calibrate_conf(mode, top1_prob_raw)
-        # NOS3-202: collapse telemetry-indistinguishable sub-techniques.
+        # AINOS3-26: collapse telemetry-indistinguishable sub-techniques.
         predicted_cluster = self._cluster_map.get(top1_class, top1_class)
         # Below-confidence override: emit "unknown" but keep the top probs
         # for post-hoc analysis.
@@ -557,7 +557,7 @@ class Plugin(AIPlugin):
             "predictions": top,
         }
 
-        # NOS3-201: feed the anomalous frame's cluster vote into the incident.
+        # AINOS3-25: feed the anomalous frame's cluster vote into the incident.
         closed = self._incident_agg.update(
             frame_idx, is_anomaly=True, mode=mode,
             cluster=predicted_cluster, sub_technique=top1_class,

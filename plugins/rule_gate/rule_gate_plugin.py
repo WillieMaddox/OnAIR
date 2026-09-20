@@ -143,7 +143,7 @@ import sys as _sys
 
 from onair.src.ai_components.ai_plugin_abstract.ai_plugin import AIPlugin
 
-# Reuse the incident aggregator (NOS3-201) that ships in the sibling
+# Reuse the incident aggregator (AINOS3-25) that ships in the sibling
 # xgb_classifier plugin package, so rule-gate alerts fold into the SAME Incident
 # format the IF→classifier path uses (operators OR the two incident streams).
 _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "xgb_classifier"))
@@ -404,7 +404,7 @@ class Plugin(AIPlugin):
         # whichever single rule (usually R2 evs-flood) outlasts the others.
         "BusSweepMinRules": "3",
         "HeartbeatEvery": "1000",
-        # Incident aggregation (NOS3-201). The rule-gate's leaky integrator
+        # Incident aggregation (AINOS3-25). The rule-gate's leaky integrator
         # already smoothed flicker, so the incident layer's own hysteresis is
         # small — it just folds a sustained alert into one labeled incident.
         "WriteIncidentFile": "true",
@@ -578,7 +578,7 @@ class Plugin(AIPlugin):
         self._frame_count = 0
         self._latest_active = []
 
-        # Incident aggregation (NOS3-201): fold rule-gate alerts into the same
+        # Incident aggregation (AINOS3-25): fold rule-gate alerts into the same
         # labeled Incident format the IF→classifier path emits.
         self._incident_agg = IncidentAggregator(
             alert_hysteresis=_int("IncidentAlertHysteresis"),
@@ -844,7 +844,7 @@ class Plugin(AIPlugin):
 
         self._latest_active = sorted(r for r, a in self._rule_active.items() if a)
 
-        # ── Fold the alert into a labeled incident (NOS3-201) ───────────────
+        # ── Fold the alert into a labeled incident (AINOS3-25) ───────────────
         # R3 (SB send-errors) is a noisy background artifact in NOS3 — a stack
         # with an unconnected downlink spams RADIO device-HK failures that climb
         # CFE_SB.MsgSendErrorCounter continuously (measured ~8/frame nominal). It

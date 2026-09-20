@@ -38,7 +38,7 @@ alternate between two buffer values (e.g. LC.MonitoredMsgCount oscillates
      (DropFloor) is also excluded as a reset/wrap.
 
 Emits a sibling side-file `consistency_out_<ts>_pid<N>.csv` and, via the shared
-IncidentAggregator (NOS3-201), labeled EX-0014.02 incidents — single-sample
+IncidentAggregator (AINOS3-25), labeled EX-0014.02 incidents — single-sample
 sensitive (IncidentMinAnomalyFrames=1) because spoofs are transient. Operators OR
 this incident stream with the IF→classifier and rule-gate streams.
 """
@@ -54,7 +54,7 @@ import sys as _sys
 
 from onair.src.ai_components.ai_plugin_abstract.ai_plugin import AIPlugin
 
-# Reuse the incident aggregator (NOS3-201) from the sibling xgb_classifier package
+# Reuse the incident aggregator (AINOS3-25) from the sibling xgb_classifier package
 # so spoof detections fold into the SAME Incident format the other gates emit.
 _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "xgb_classifier"))
 from incident import IncidentAggregator  # noqa: E402
@@ -144,7 +144,7 @@ class Plugin(AIPlugin):
         self._frame_count = 0
         self._latest_violations = []
 
-        # Incident aggregation (NOS3-201).
+        # Incident aggregation (AINOS3-25).
         self._incident_agg = IncidentAggregator(
             alert_hysteresis=_int("IncidentAlertHysteresis"),
             clear_hysteresis=_int("IncidentClearHysteresis"),
@@ -245,7 +245,7 @@ class Plugin(AIPlugin):
             self._win[i].append(v)
         self._latest_violations = violations
 
-        # ── Fold into a labeled EX-0014.02 incident (NOS3-201) ──────────────
+        # ── Fold into a labeled EX-0014.02 incident (AINOS3-25) ──────────────
         mode = _MODE_NAME.get(int(m), str(m)) if (m := (_to_num(low_level_data[self._mode_idx])
               if self._mode_idx is not None and self._mode_idx < n else None)) is not None else ""
         sub = f"{violations[0][0]}-backwards" if violations else ""

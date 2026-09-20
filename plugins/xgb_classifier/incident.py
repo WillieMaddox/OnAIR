@@ -1,6 +1,6 @@
 # GSC-19165-1, "The On-Board Artificial Intelligence Research (OnAIR) Platform"
 # Licensed under the NASA Open Source Agreement version 1.3
-"""Incident aggregation for the OnAIR attack classifier (NOS3-201).
+"""Incident aggregation for the OnAIR attack classifier (AINOS3-25).
 
 Collapses a hysteresis-confirmed run of anomalous frames into a single
 *incident*: start/end frame, duration, dominant attack cluster + sub-technique,
@@ -10,7 +10,7 @@ of independent per-frame flags.
 
 Pure-Python and framework-free on purpose: the live OnAIR plugin feeds it the
 same per-frame stream it already computes, and the offline corpus re-score
-(NOS3-203) drives the *identical* logic so live and offline incident metrics
+(AINOS3-27) drives the *identical* logic so live and offline incident metrics
 agree by construction.
 
 State machine mirrors the Isolation-Forest plugin's alert/clear hysteresis:

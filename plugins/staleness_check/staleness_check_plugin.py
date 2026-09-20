@@ -37,7 +37,7 @@ own steady-state no-advance gap, so a slow-but-live counter (e.g. EVS every ~14
 frames) never false-alarms while a fast one is caught quickly.
 
 Emits a sibling side-file `staleness_out_<ts>_pid<N>.csv` and, via the shared
-IncidentAggregator (NOS3-201), labeled EX-0012.02 incidents spanning the freeze.
+IncidentAggregator (AINOS3-25), labeled EX-0012.02 incidents spanning the freeze.
 Operators OR this incident stream with the other three gates.
 """
 from __future__ import annotations
@@ -51,7 +51,7 @@ import sys as _sys
 
 from onair.src.ai_components.ai_plugin_abstract.ai_plugin import AIPlugin
 
-# Reuse the incident aggregator (NOS3-201) from the sibling xgb_classifier package.
+# Reuse the incident aggregator (AINOS3-25) from the sibling xgb_classifier package.
 _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "xgb_classifier"))
 from incident import IncidentAggregator  # noqa: E402
 
