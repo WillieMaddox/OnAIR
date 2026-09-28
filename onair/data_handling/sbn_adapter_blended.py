@@ -568,7 +568,7 @@ def load_adapter_config(ini_path=None):
         cfg['csvfilenametemplate'] = co.get('filenametemplate', cfg['csvfilenametemplate'])
     if parser.has_section('SBN_ADAPTER'):
         sa = dict(parser.items('SBN_ADAPTER'))
-        for k in ('blendmode', 'blendedfilenametemplate', 'blendedoutputdir', 'profileevery', 'flushevery', 'frametimestamp'):
+        for k in ('blendmode', 'blendedfilenametemplate', 'blendedoutputdir', 'profileevery', 'flushevery', 'frametimestamp', 'frameintervalms'):
             if k in sa:
                 cfg[k] = sa[k]
     if parser.has_section('FILES'):
@@ -621,6 +621,22 @@ class DataSource(sbn_adapter.DataSource):
             prof_every = 0
         self._prof = _Profiler(prof_every) if prof_every > 0 else None
         self._warned_len = False
+
+        # Frame-rate cap. The recorder writes one row per get_next(), and
+        # get_next() returns as soon as ANY subscribed message has arrived, so
+        # the row rate rides the aggregate SBN arrival rate (measured ~6 Hz at
+        # 1 Hz sensors, ~16 Hz at 10 Hz sensors). That makes columns whose MID
+        # publishes slower than the row rate repeat for several rows. Capping
+        # the frame rate to a fixed cadence and publishing every dynamic MID
+        # ABOVE that cadence (oversample-then-decimate) makes each emitted row
+        # land on fresh data. FrameIntervalMs = 0 disables the cap (stock
+        # arrival-driven behaviour); 200 -> a steady 5 Hz.
+        try:
+            self._frame_interval_s = max(
+                0.0, float(self._cfg.get('frameintervalms', '0')) / 1000.0)
+        except ValueError:
+            self._frame_interval_s = 0.0
+        self._last_emit = None
 
         super().__init__(data_file, meta_file, ss_breakdown)
 
@@ -754,7 +770,17 @@ class DataSource(sbn_adapter.DataSource):
         ⚠ The parent's `get_next()` is CALLED, not reimplemented. The raw read
         path — the buffer flip, the lock, the wait — is untouched.
         """
+        # Pace BEFORE reading so the frame we return is the freshest available
+        # at the cap instant, not one held from the top of the interval. The
+        # cap is a ceiling only: super().get_next() still blocks for data, so a
+        # slow stream simply emits slower than the cap.
+        if self._frame_interval_s > 0.0 and self._last_emit is not None:
+            wait = self._frame_interval_s - (time.monotonic() - self._last_emit)
+            if wait > 0.0:
+                time.sleep(wait)
+
         frame = super().get_next()
+        self._last_emit = time.monotonic()
 
         # ⚠ Stamped on the frame that is being RETURNED, so the raw file
         # (written by csv_output) and the blended file (written here) carry the

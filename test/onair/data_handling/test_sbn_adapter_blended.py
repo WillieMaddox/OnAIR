@@ -317,6 +317,15 @@ def test_load_adapter_config_shares_outputdir_and_excludes_with_csv_output(tmp_p
     assert cfg["profileevery"] == "500"
 
 
+def test_load_adapter_config_reads_frameintervalms(tmp_path):
+    """The frame-rate cap key must survive the [SBN_ADAPTER] whitelist, or the
+    cap silently defaults to off (the 2026-09-26 regression)."""
+    ini = tmp_path / "x.ini"
+    ini.write_text("[SBN_ADAPTER]\nBlendMode = tap\nFrameIntervalMs = 200\n")
+    cfg = load_adapter_config(str(ini))
+    assert cfg["frameintervalms"] == "200"
+
+
 def test_blended_file_keeps_the_csv_out_basename():
     """⚠ The DIRECTORY marks data as blended, not the filename. That is the
     convention deinterleave_csv.py set (it preserves the source basename into
@@ -363,6 +372,8 @@ def test_side_file_lands_in_its_own_directory(mocker, tmp_path):
 def _meta_cut(mocker, *, stamp=True, n=3):
     """A DataSource whose parent parse_meta_data_file is stubbed out."""
     cut = DataSource.__new__(DataSource)
+    cut._frame_interval_s = 0.0
+    cut._last_emit = None
     cut._stamp_frames = stamp
     cut._ts_idx = None
     cut._stamp_simtime = False
@@ -533,6 +544,8 @@ def test_sim_column_skipped_when_gps_is_not_subscribed(mocker, capsys):
 
 def _cut(mode, headers, mocker, tmp_path=None, cfg_extra=None):
     cut = DataSource.__new__(DataSource)
+    cut._frame_interval_s = 0.0
+    cut._last_emit = None
     cut.blend_mode = mode
     cut._blend = None
     cut._writer = None
@@ -644,3 +657,34 @@ def test_tap_mode_output_matches_the_offline_blend_of_its_own_raw_file(mocker, t
     r = v.compare(raw_w.file_name, cut._writer.file_name)
     assert r["ok"], r["diffs"]
     assert r["compared_rows"] == len(frames)
+
+
+def test_frame_interval_caps_the_row_rate(mocker, tmp_path):
+    """FrameIntervalMs paces get_next(): a fast parent stream is emitted no
+    faster than the cap, and the cap never blocks the FIRST frame."""
+    import time
+    cut = _cut("off", ["a", "b"], mocker, tmp_path)
+    cut._frame_interval_s = 0.05  # 20 Hz cap
+    mocker.patch.object(blended.sbn_adapter.DataSource, 'get_next',
+                        return_value=["1", "2"])
+
+    t0 = time.monotonic()
+    cut.get_next()                       # first frame: no wait (last_emit None)
+    t1 = time.monotonic()
+    cut.get_next()                       # second frame: paced to >= interval
+    t2 = time.monotonic()
+
+    assert (t1 - t0) < 0.05              # first is immediate
+    assert (t2 - t1) >= 0.045            # second waits ~one interval
+
+
+def test_frame_interval_zero_disables_the_cap(mocker, tmp_path):
+    """FrameIntervalMs = 0 is the stock arrival-driven path: no pacing sleep."""
+    import time
+    cut = _cut("off", ["a", "b"], mocker, tmp_path)
+    cut._frame_interval_s = 0.0
+    mocker.patch.object(blended.sbn_adapter.DataSource, 'get_next',
+                        return_value=["1", "2"])
+    t0 = time.monotonic()
+    cut.get_next(); cut.get_next(); cut.get_next()
+    assert (time.monotonic() - t0) < 0.02
