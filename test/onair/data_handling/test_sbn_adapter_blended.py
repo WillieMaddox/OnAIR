@@ -22,6 +22,7 @@ assert the copies still agree with the originals.
 
 import csv
 import importlib.util
+import json
 import os
 import sys
 from unittest.mock import MagicMock
@@ -35,8 +36,8 @@ sys.modules.setdefault('message_headers', MagicMock())
 import onair.data_handling.sbn_adapter_blended as blended
 from onair.data_handling.sbn_adapter_blended import (
     SENTINEL, SIM_TIME_COLUMN, TIMESTAMP_COLUMN, BlendEngine, BlendedCsvWriter,
-    DataSource, SimClock, _stringify, load_adapter_config, read_sim_epoch,
-    resolve_blended_dir)
+    ArrivalMeter, DataSource, SimClock, _stringify, load_adapter_config,
+    read_sim_epoch, resolve_arrival_dir, resolve_blended_dir)
 
 
 # ---------------------------------------------------------------- helpers
@@ -45,8 +46,24 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ONAIR = os.path.abspath(os.path.join(_HERE, '..', '..', '..', '..'))
 
 
-def _load_by_path(mod_name, rel_path):
-    path = os.path.join(_ONAIR, rel_path)
+
+
+def _training_dir():
+    """The reference tooling (`deinterleave_csv.py`, `verify_blend_equivalence.py`).
+
+    It moved out of the nos3 fork into the sibling `ainos3/` repo at the
+    thin-fork cutover (`~/git/nasa/{ainos3,nos3}`), so look there as well as at
+    the old in-fork location.
+    """
+    for c in (os.path.join(_ONAIR, "training"),
+              os.path.abspath(os.path.join(_ONAIR, "..", "..", "..", "ainos3", "training"))):
+        if os.path.exists(os.path.join(c, "deinterleave_csv.py")):
+            return c
+    pytest.skip("reference tooling not found: expected the ainos3 repo beside nos3")
+
+
+def _load_by_path(mod_name, rel_path, root=None):
+    path = os.path.join(root or _ONAIR, rel_path)
     spec = importlib.util.spec_from_file_location(mod_name, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -56,7 +73,7 @@ def _load_by_path(mod_name, rel_path):
 @pytest.fixture(scope="module")
 def offline():
     """training/deinterleave_csv.py — the reference implementation."""
-    return _load_by_path("deinterleave_csv_ref", "training/deinterleave_csv.py")
+    return _load_by_path("deinterleave_csv_ref", "deinterleave_csv.py", _training_dir())
 
 
 def _offline_blend(offline, frames, fields):
@@ -374,6 +391,7 @@ def _meta_cut(mocker, *, stamp=True, n=3):
     cut = DataSource.__new__(DataSource)
     cut._frame_interval_s = 0.0
     cut._last_emit = None
+    cut._arrivals = None
     cut._stamp_frames = stamp
     cut._ts_idx = None
     cut._stamp_simtime = False
@@ -546,6 +564,7 @@ def _cut(mode, headers, mocker, tmp_path=None, cfg_extra=None):
     cut = DataSource.__new__(DataSource)
     cut._frame_interval_s = 0.0
     cut._last_emit = None
+    cut._arrivals = None
     cut.blend_mode = mode
     cut._blend = None
     cut._writer = None
@@ -652,7 +671,7 @@ def test_tap_mode_output_matches_the_offline_blend_of_its_own_raw_file(mocker, t
     raw_w.close()
     cut._writer.close()
 
-    sys.path.insert(0, os.path.join(_ONAIR, "training"))
+    sys.path.insert(0, _training_dir())
     import verify_blend_equivalence as v
     r = v.compare(raw_w.file_name, cut._writer.file_name)
     assert r["ok"], r["diffs"]
@@ -688,3 +707,107 @@ def test_frame_interval_zero_disables_the_cap(mocker, tmp_path):
     t0 = time.monotonic()
     cut.get_next(); cut.get_next(); cut.get_next()
     assert (time.monotonic() - t0) < 0.02
+
+
+# ------------------------------------------------------- arrival meter
+
+class _Clock:
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def test_arrival_meter_reports_each_packets_rate_and_gaps(tmp_path):
+    clk = _Clock()
+    m = ArrivalMeter(10, str(tmp_path), clock=clk)
+    for i in range(50):                      # 5 Hz for 10 s
+        m.record("FAST", now=i * 0.2)
+    for t in (0.0, 4.0, 8.0):                # 0.25 Hz
+        m.record("SLOW", now=t)
+    clk.t = 10.0
+    snap = m.snapshot()
+    fast, slow = snap["packets"]["FAST"], snap["packets"]["SLOW"]
+    assert snap["window_s"] == 10.0
+    assert (fast["n"], fast["hz"], fast["gap_p50_ms"]) == (50, 5.0, 200.0)
+    assert (slow["n"], slow["hz"], slow["gap_max_ms"]) == (3, 0.3, 4000.0)
+    assert slow["since_last_ms"] == 2000.0
+
+
+def test_arrival_meter_reports_a_registered_packet_that_never_arrives(tmp_path):
+    """A MID that never arrives is exactly what must not vanish from the report."""
+    clk = _Clock()
+    m = ArrivalMeter(10, str(tmp_path), clock=clk)
+    m.register(["SILENT"])
+    clk.t = 10.0
+    s = m.snapshot()["packets"]["SILENT"]
+    assert (s["n"], s["hz"], s["since_last_ms"], s["total"]) == (0, 0.0, None, 0)
+
+
+def test_arrival_meter_windows_reset_but_totals_accumulate(tmp_path):
+    clk = _Clock()
+    m = ArrivalMeter(1, str(tmp_path), clock=clk)
+    m.record("A", now=0.1)
+    m.record("A", now=0.6)
+    clk.t = 1.0
+    assert not m.due(0.5) and m.due()
+    m.snapshot()
+    m.record("A", now=1.5)                   # gap spans the window boundary
+    clk.t = 2.0
+    a = m.snapshot()["packets"]["A"]
+    assert (a["n"], a["total"], a["gap_max_ms"]) == (1, 3, 900.0)
+
+
+def test_arrival_meter_disabled_is_never_due(tmp_path):
+    assert not ArrivalMeter(0, str(tmp_path), clock=_Clock(1e9)).due()
+
+
+def test_arrival_meter_appends_one_json_line_per_report(tmp_path, capsys):
+    clk = _Clock()
+    m = ArrivalMeter(1, str(tmp_path / "arrivals"), clock=clk)
+    m.record("A", now=0.5)
+    clk.t = 1.0
+    m.report()
+    clk.t = 2.0
+    m.report()
+    name = os.path.basename(m.file_name)
+    assert name.startswith("arrivals_") and name.endswith(f"_pid{os.getpid()}.jsonl")
+    lines = [json.loads(l) for l in open(m.file_name)]
+    assert [l["packets"]["A"]["n"] for l in lines] == [1, 0]
+    assert "arrivals Hz" in capsys.readouterr().out
+
+
+def test_arrival_dir_defaults_to_a_sibling_of_csv_output():
+    assert resolve_arrival_dir(None, "/d/onair/csv") == "/d/onair/arrivals"
+    assert resolve_arrival_dir(" /x ", "/d/onair/csv") == "/x"
+
+
+def test_load_adapter_config_reads_the_arrival_keys(tmp_path):
+    """Both keys must survive the [SBN_ADAPTER] whitelist (see the
+    FrameIntervalMs regression)."""
+    ini = tmp_path / "x.ini"
+    ini.write_text("[SBN_ADAPTER]\nArrivalReportEvery = 10\nArrivalOutputDir = /a\n")
+    cfg = load_adapter_config(str(ini))
+    assert (cfg["arrivalreportevery"], cfg["arrivaloutputdir"]) == ("10", "/a")
+    assert load_adapter_config(str(tmp_path / "none.ini"))["arrivalreportevery"] == "0"
+
+
+def test_get_current_data_counts_the_packet_then_defers_to_the_parent(mocker, tmp_path):
+    cut = _cut("tap", ["a"], mocker, tmp_path)
+    cut._arrivals = ArrivalMeter(10, str(tmp_path), clock=_Clock())
+    parent = mocker.patch.object(blended.sbn_adapter.DataSource, 'get_current_data')
+    cut.get_current_data("msg", "struct", "CFE_ES")
+    parent.assert_called_once_with("msg", "struct", "CFE_ES")
+    assert cut._arrivals.snapshot()["packets"]["CFE_ES"]["total"] == 1
+
+
+def test_get_next_reports_arrivals_when_due_and_leaves_the_frame_alone(mocker, tmp_path):
+    cut = _cut("off", ["a"], mocker, tmp_path)
+    clk = _Clock()
+    cut._arrivals = ArrivalMeter(1, str(tmp_path / "arr"), clock=clk)
+    frame = ["1"]
+    mocker.patch.object(blended.sbn_adapter.DataSource, 'get_next', return_value=frame)
+    assert cut.get_next() is frame and cut._arrivals.file_name is None
+    clk.t = 1.0
+    assert cut.get_next() is frame and os.path.exists(cut._arrivals.file_name)

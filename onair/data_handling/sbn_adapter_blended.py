@@ -98,13 +98,14 @@ import hashlib
 import json
 import os
 import socket
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
 import onair.data_handling.sbn_adapter as sbn_adapter
 
 
-ADAPTER_VERSION = "sbn_adapter_blended@1.1"
+ADAPTER_VERSION = "sbn_adapter_blended@1.2"
 
 # ⚠ A REAL per-row timestamp, stamped when the frame is read.
 #
@@ -502,6 +503,116 @@ class _Profiler:
         )
 
 
+class ArrivalMeter:
+    """How often each subscribed packet ACTUALLY arrives over SBN.
+
+    Exists because the CSV cannot answer that question. A counter such as
+    `CFE_ES.CommandCounter` is static in nominal flight, so its column changes
+    zero times per second whether its packet lands at 0.25 Hz or at 5 Hz — yet
+    that cadence is exactly what decides whether a fast attack (DE-0003.01's
+    NOOP+RESET in 0.7 s) is visible at all. Arrivals are counted at the
+    listener, before any buffering, blending, or frame-rate cap.
+
+    ⚠ Log-only by design. Nothing here enters the frame, so the recorded
+    schema (and `recorded_schema_sha256`, the AINOS3-124 freeze) is untouched.
+
+    `record()` runs on the SBN listener thread and `report()` on the OnAIR
+    main thread, hence the lock. Each report covers the window since the
+    previous one and appends one JSON line to `arrivals_<ts>_pid<N>.jsonl`.
+    """
+
+    def __init__(self, every_s, output_dir, clock=time.monotonic):
+        self.every_s = float(every_s)
+        self.output_dir = output_dir
+        self.clock = clock
+        self.pid = os.getpid()
+        self.file_name = None
+        self._lock = threading.Lock()
+        self._total = {}
+        self._n = {}
+        self._gaps = {}
+        self._last = {}
+        self._win_start = clock()
+
+    def register(self, packets):
+        """Pre-seed packets so one that NEVER arrives still reports n = 0."""
+        with self._lock:
+            for p in packets:
+                self._total.setdefault(p, 0)
+                self._n.setdefault(p, 0)
+                self._gaps.setdefault(p, [])
+
+    def record(self, packet, now=None):
+        now = self.clock() if now is None else now
+        with self._lock:
+            self._total[packet] = self._total.get(packet, 0) + 1
+            self._n[packet] = self._n.get(packet, 0) + 1
+            last = self._last.get(packet)
+            if last is not None:
+                self._gaps.setdefault(packet, []).append(now - last)
+            else:
+                self._gaps.setdefault(packet, [])
+            self._last[packet] = now
+
+    def due(self, now=None):
+        now = self.clock() if now is None else now
+        return self.every_s > 0 and (now - self._win_start) >= self.every_s
+
+    def snapshot(self, now=None):
+        """Stats for the window since the last snapshot; starts a new window."""
+        now = self.clock() if now is None else now
+        with self._lock:
+            window = now - self._win_start
+            packets = {}
+            for p in sorted(self._total):
+                gaps = sorted(self._gaps.get(p, []))
+                last = self._last.get(p)
+                packets[p] = {
+                    'n': self._n.get(p, 0),
+                    'hz': round(self._n.get(p, 0) / window, 3) if window > 0 else None,
+                    'gap_p50_ms': round(gaps[len(gaps) // 2] * 1e3, 1) if gaps else None,
+                    'gap_max_ms': round(gaps[-1] * 1e3, 1) if gaps else None,
+                    # A packet that has STOPPED shows here, not in gap_max_ms,
+                    # which only sees gaps that have already closed.
+                    'since_last_ms': round((now - last) * 1e3, 1) if last is not None else None,
+                    'total': self._total[p],
+                }
+                self._n[p] = 0
+                self._gaps[p] = []
+            self._win_start = now
+        return {'utc': datetime.now(timezone.utc).isoformat(),
+                'window_s': round(window, 3), 'packets': packets}
+
+    def write(self, snap):
+        if self.file_name is None:
+            os.makedirs(self.output_dir, exist_ok=True)
+            ts = datetime.now().strftime('%Y-%m-%dT%H-%M-%S-%f')
+            self.file_name = os.path.join(self.output_dir, f"arrivals_{ts}_pid{self.pid}.jsonl")
+        with open(self.file_name, 'a') as f:
+            f.write(json.dumps(snap) + '\n')
+
+    @staticmethod
+    def summary(snap):
+        by_hz = sorted(snap['packets'].items(), key=lambda kv: (kv[1]['hz'] or 0.0))
+        body = ", ".join(f"{p} {s['hz']:.2f}" for p, s in by_hz if s['hz'] is not None)
+        return f"[sbn_adapter_blended] arrivals Hz over {snap['window_s']:.1f}s: {body}"
+
+    def report(self, now=None):
+        snap = self.snapshot(now)
+        self.write(snap)
+        print(self.summary(snap), flush=True)
+        return snap
+
+
+def resolve_arrival_dir(configured, csv_output_dir):
+    """Blank -> a SIBLING `arrivals/` of csv_output's dir, for the same reason
+    `resolve_blended_dir` keeps blended output out of `csv/`."""
+    if configured and str(configured).strip():
+        return str(configured).strip()
+    parent = os.path.dirname(csv_output_dir.rstrip('/')) or '.'
+    return os.path.normpath(os.path.join(parent, 'arrivals'))
+
+
 def _ini_path():
     return os.environ.get('ONAIR_INI_FILE') or 'cf/onair/nos3_security.ini'
 
@@ -551,6 +662,8 @@ def load_adapter_config(ini_path=None):
         'flushevery': '1',
         'frametimestamp': 'true',
         'simtime': 'true',
+        'arrivalreportevery': '0',
+        'arrivaloutputdir': None,
         'outputdir': 'data/onair/csv',
         'excludecolumns': '',
         'csvfilenametemplate': 'csv_out_{timestamp}_pid{pid}',
@@ -568,7 +681,8 @@ def load_adapter_config(ini_path=None):
         cfg['csvfilenametemplate'] = co.get('filenametemplate', cfg['csvfilenametemplate'])
     if parser.has_section('SBN_ADAPTER'):
         sa = dict(parser.items('SBN_ADAPTER'))
-        for k in ('blendmode', 'blendedfilenametemplate', 'blendedoutputdir', 'profileevery', 'flushevery', 'frametimestamp', 'frameintervalms'):
+        for k in ('blendmode', 'blendedfilenametemplate', 'blendedoutputdir', 'profileevery', 'flushevery', 'frametimestamp', 'frameintervalms',
+                  'arrivalreportevery', 'arrivaloutputdir'):
             if k in sa:
                 cfg[k] = sa[k]
     if parser.has_section('FILES'):
@@ -638,7 +752,23 @@ class DataSource(sbn_adapter.DataSource):
             self._frame_interval_s = 0.0
         self._last_emit = None
 
+        # Built BEFORE super().__init__: connect() starts the listener thread,
+        # which calls get_current_data() -> self._arrivals.record().
+        try:
+            arrival_every = float(self._cfg.get('arrivalreportevery', '0'))
+        except ValueError:
+            arrival_every = 0.0
+        self._arrivals = ArrivalMeter(
+            arrival_every,
+            resolve_arrival_dir(self._cfg.get('arrivaloutputdir'),
+                                self._cfg.get('outputdir'))) if arrival_every > 0 else None
+
         super().__init__(data_file, meta_file, ss_breakdown)
+
+        if self._arrivals is not None:
+            self._arrivals.register(v[0] for v in self.msgID_lookup_table.values())
+            print(f"[sbn_adapter_blended] arrival meter every {arrival_every:g}s -> "
+                  f"{self._arrivals.output_dir}")
 
         print(f"[sbn_adapter_blended] {ADAPTER_VERSION} BlendMode={self.blend_mode}")
         if self.blend_mode == 'inline':
@@ -764,6 +894,12 @@ class DataSource(sbn_adapter.DataSource):
         )
         print(f"[sbn_adapter_blended] blended stream -> {self._writer._make_filename()} (template)")
 
+    def get_current_data(self, recv_msg, data_struct, app_name):
+        """Count the arrival, then hand the packet to the parent unchanged."""
+        if self._arrivals is not None:
+            self._arrivals.record(app_name)
+        return super().get_current_data(recv_msg, data_struct, app_name)
+
     def get_next(self):
         """One coherent frame, or the raw frame with the blend side-written.
 
@@ -781,6 +917,9 @@ class DataSource(sbn_adapter.DataSource):
 
         frame = super().get_next()
         self._last_emit = time.monotonic()
+
+        if self._arrivals is not None and self._arrivals.due():
+            self._arrivals.report()
 
         # ⚠ Stamped on the frame that is being RETURNED, so the raw file
         # (written by csv_output) and the blended file (written here) carry the
