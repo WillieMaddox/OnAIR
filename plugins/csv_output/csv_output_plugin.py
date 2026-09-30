@@ -71,7 +71,7 @@ class Plugin(AIPlugin):
     """
 
     DEFAULTS = {
-        'OutputDir': 'data/onair/csv',
+        'OutputDir': 'data/csv',
         'FilenameTemplate': 'csv_out_{timestamp}_pid{pid}',
         'LinesPerFile': '0',
         'WriteHeaderOnRotation': 'true',

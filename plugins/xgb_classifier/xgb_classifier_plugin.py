@@ -34,9 +34,9 @@ Activation:
        }
 
        [XGB_CLASSIFIER]
-       ClassifierPath = data/onair/models/xgb_attack_classifier_v1.pkl
+       ClassifierPath = data/models/xgb_attack_classifier_v1.pkl
        CalibrationPath =        # empty ⇒ derive as <model>.calibration.json
-       IfModelPath = data/onair/models/iforest_per_mode_v5_invariant_bolstered.pkl
+       IfModelPath = data/models/iforest_per_mode_v5_invariant_bolstered.pkl
        IfCalibrationPath =
        # IF-gating mode resolution copied from the IF plugin's RuntimeRouting
        # so this plugin and the IF stay in lock-step on which model scored
@@ -114,12 +114,12 @@ class Plugin(AIPlugin):
     """
 
     DEFAULTS = {
-        "ClassifierPath": "data/onair/models/xgb_attack_classifier_v1.pkl",
+        "ClassifierPath": "data/models/xgb_attack_classifier_v1.pkl",
         "CalibrationPath": "",  # empty → derive as <model>.calibration.json
-        "IfModelPath": "data/onair/models/iforest_per_mode_v5_invariant_bolstered.pkl",
+        "IfModelPath": "data/models/iforest_per_mode_v5_invariant_bolstered.pkl",
         "IfCalibrationPath": "",
         "WriteSideFile": "true",
-        "SideFileOutputDir": "../../../../data/onair/csv",
+        "SideFileOutputDir": "../../../../data/csv",
         "SideFileFlushEvery": "10",
         "TopK": "3",
         "MinConfidence": "0.30",

@@ -84,7 +84,7 @@ class Plugin(AIPlugin):
 
     DEFAULTS = {
         "WriteSideFile": "true",
-        "SideFileOutputDir": "../../../../data/onair/csv",
+        "SideFileOutputDir": "../../../../data/csv",
         "SideFileFlushEvery": "10",
         "WarmupFrames": "30",
         # "auto" = discover wide monotonic counters during warmup, or a comma list.

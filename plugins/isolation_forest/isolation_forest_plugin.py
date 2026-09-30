@@ -32,8 +32,8 @@ Activation:
        LearnersPluginDict = {'iforest': 'cf/onair/plugins/isolation_forest/__init__.py'}
 
        [ISOLATION_FOREST]
-       ModelPath = data/onair/models/iforest_per_scenario_v3_multiuptime.pkl
-       CalibrationPath = data/onair/models/iforest_per_scenario_v3_multiuptime.calibration.json
+       ModelPath = data/models/iforest_per_scenario_v3_multiuptime.pkl
+       CalibrationPath = data/models/iforest_per_scenario_v3_multiuptime.calibration.json
        Scenario = nominal_ops
        AnomalyThreshold = 0.0   # fallback if calibration missing for the scenario
 4. Sync: re-run the OnAIR build (CMakeLists copies plugins to fsw/build/exe/cpu1/cf/onair/plugins/)
@@ -111,7 +111,7 @@ class Plugin(AIPlugin):
     """
 
     DEFAULTS = {
-        "ModelPath": "data/onair/models/iforest_per_scenario_v3_multiuptime.pkl",
+        "ModelPath": "data/models/iforest_per_scenario_v3_multiuptime.pkl",
         "CalibrationPath": "",  # empty → derive as <model>.calibration.json
         "Scenario": "nominal_ops",  # which per-scenario IF to route through
         "AnomalyThreshold": "0.0",  # fallback if calibration missing
@@ -121,7 +121,7 @@ class Plugin(AIPlugin):
         "WriteSideFile": "true",
         # Default mirrors csv_output's OutputDir; both plugins resolve relative
         # to OnAIR cwd (fsw/build/exe/cpu1) at runtime.
-        "SideFileOutputDir": "../../../../data/onair/csv",
+        "SideFileOutputDir": "../../../../data/csv",
         "SideFileFlushEvery": "10",  # rows buffered before each fsync-less append
         # AINOS3-121: golden-frame capture for the offline IF-audit harness.
         # When >0, every Nth frame the EXACT feature vector the model scored is

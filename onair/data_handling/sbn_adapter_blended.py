@@ -623,12 +623,12 @@ def resolve_blended_dir(configured, csv_output_dir):
     ⚠ Not `csv_output`'s own directory, and the reason is not tidiness:
 
       * `AINOS3-125 AC4` already put the offline-blended corpus in
-        `data/onair/csv_blended/`, keeping each file's `csv_out_*` basename.
+        `data/csv_blended/`, keeping each file's `csv_out_*` basename.
         The DIRECTORY carries the meaning, so native output keeps the same
         basename and every tool globbing `csv_out_*.csv` — `loader.load`,
         `list_clean_csvs`, `build_corpus_manifest` — works on either
         directory with no change and no filename-prefix special case.
-      * `data/onair/csv` holds 11 recording generations AND every plugin
+      * `data/csv` holds 11 recording generations AND every plugin
         side-file (`attack_class_`, `iforest_out_`, `rule_gate_out_`, ...).
         Adding a fourth filename family to the pile `AINOS3-97` exists to
         quarantine makes that job harder, and any tool that globs `*.csv`
@@ -664,7 +664,7 @@ def load_adapter_config(ini_path=None):
         'simtime': 'true',
         'arrivalreportevery': '0',
         'arrivaloutputdir': None,
-        'outputdir': 'data/onair/csv',
+        'outputdir': 'data/csv',
         'excludecolumns': '',
         'csvfilenametemplate': 'csv_out_{timestamp}_pid{pid}',
         'schema_path': None,

@@ -83,7 +83,7 @@ class Plugin(AIPlugin):
 
     DEFAULTS = {
         "WriteSideFile": "true",
-        "SideFileOutputDir": "../../../../data/onair/csv",
+        "SideFileOutputDir": "../../../../data/csv",
         "SideFileFlushEvery": "10",
         # Skip the startup transient BEFORE measuring liveness (MIDs come online
         # over several frames).

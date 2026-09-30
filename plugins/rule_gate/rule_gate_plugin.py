@@ -297,7 +297,7 @@ class Plugin(AIPlugin):
 
     DEFAULTS = {
         "WriteSideFile": "true",
-        "SideFileOutputDir": "../../../../data/onair/csv",  # mirrors IF/csv_output
+        "SideFileOutputDir": "../../../../data/csv",  # mirrors IF/csv_output
         "SideFileFlushEvery": "10",
         # Startup-transient suppression: the first frames after connect have
         # not-yet-arrived MIDs (placeholder + huge first deltas). During warmup

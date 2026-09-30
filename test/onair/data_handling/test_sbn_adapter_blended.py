@@ -354,12 +354,12 @@ def test_blended_file_keeps_the_csv_out_basename():
 
 
 def test_blended_dir_defaults_to_a_sibling_not_csv_outputs_own_dir():
-    """⚠ NOT data/onair/csv. That directory already mixes 11 recording
+    """⚠ NOT data/csv. That directory already mixes 11 recording
     generations with every plugin side-file, and AINOS3-125 AC4 put the
-    offline-blended corpus in data/onair/csv_blended/ — native output has to
+    offline-blended corpus in data/csv_blended/ — native output has to
     land in the same place or one corpus is split across two conventions."""
-    assert resolve_blended_dir(None, "../../../../data/onair/csv") == \
-        "../../../../data/onair/csv_blended"
+    assert resolve_blended_dir(None, "../../../../data/csv") == \
+        "../../../../data/csv_blended"
     assert resolve_blended_dir("", "/a/b/csv") == "/a/b/csv_blended"
     assert resolve_blended_dir("   ", "csv") == "csv_blended"      # normpath, not ./
 
