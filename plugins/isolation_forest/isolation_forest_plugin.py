@@ -55,6 +55,7 @@ from typing import Any
 import numpy as np
 
 from onair.src.ai_components.ai_plugin_abstract.ai_plugin import AIPlugin
+from onair.src.util import session as onair_session
 
 
 def _coerce_scalar(value: Any) -> float:
@@ -403,11 +404,7 @@ class Plugin(AIPlugin):
             side_dir = cfg.get(
                 "sidefileoutputdir", self.DEFAULTS["SideFileOutputDir"]
             )
-            os.makedirs(side_dir, exist_ok=True)
-            ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
-            self._side_file_path = os.path.join(
-                side_dir, f"iforest_out_{ts}_pid{os.getpid()}.csv"
-            )
+            self._side_file_path = onair_session.side_file("iforest", side_dir, "iforest_out")
 
         # AINOS3-121 golden capture
         self._golden_every = int(cfg.get("goldencaptureevery",
@@ -418,10 +415,8 @@ class Plugin(AIPlugin):
         self._golden_path: str | None = None
         if self._golden_every > 0:
             side_dir = cfg.get("sidefileoutputdir", self.DEFAULTS["SideFileOutputDir"])
-            os.makedirs(side_dir, exist_ok=True)
-            gts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
-            self._golden_path = os.path.join(
-                side_dir, f"iforest_golden_{gts}_pid{os.getpid()}.npz")
+            self._golden_path = onair_session.side_file(
+                "iforest_golden", side_dir, "iforest_golden", ext="npz")
             print(f"[iforest][golden] capturing every {self._golden_every} frames "
                   f"(max {self._golden_max}) -> {self._golden_path}")
 

@@ -56,7 +56,6 @@ import csv
 import json
 import os
 import pickle
-from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -68,6 +67,7 @@ _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from incident import IncidentAggregator, cluster_map_from_taxonomy  # noqa: E402
 
 from onair.src.ai_components.ai_plugin_abstract.ai_plugin import AIPlugin
+from onair.src.util import session as onair_session
 
 
 def _coerce_scalar(value: Any) -> float:
@@ -339,10 +339,7 @@ class Plugin(AIPlugin):
         if write_side:
             side_dir = cfg.get(
                 "sidefileoutputdir", self.DEFAULTS["SideFileOutputDir"])
-            os.makedirs(side_dir, exist_ok=True)
-            ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
-            self._side_file_path = os.path.join(
-                side_dir, f"attack_class_{ts}_pid{os.getpid()}.csv")
+            self._side_file_path = onair_session.side_file("attack_class", side_dir, "attack_class")
 
         # ─── AINOS3-25: incident aggregator + incident side-file ───────
         self._incident_agg = IncidentAggregator(
@@ -361,9 +358,7 @@ class Plugin(AIPlugin):
         ).strip().lower() == "true"
         if write_inc and self._side_file_path is not None:
             side_dir = cfg.get("sidefileoutputdir", self.DEFAULTS["SideFileOutputDir"])
-            ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
-            self._incident_file_path = os.path.join(
-                side_dir, f"incident_{ts}_pid{os.getpid()}.csv")
+            self._incident_file_path = onair_session.side_file("incident", side_dir, "incident")
 
         print(f"[xgb_cls] classifier loaded: {len(self.labels)} classes, "
               f"top_k={self.top_k}, min_confidence={self.min_confidence:.2f}")

@@ -47,12 +47,12 @@ from __future__ import annotations
 import collections
 import configparser
 import csv
-import datetime
 import os
 import re
 import sys as _sys
 
 from onair.src.ai_components.ai_plugin_abstract.ai_plugin import AIPlugin
+from onair.src.util import session as onair_session
 
 # Reuse the incident aggregator (AINOS3-25) from the sibling xgb_classifier package
 # so spoof detections fold into the SAME Incident format the other gates emit.
@@ -160,13 +160,10 @@ class Plugin(AIPlugin):
         self._side_file_header_written = False
         self._side_file_flush_every = _int("SideFileFlushEvery")
         out_dir = cfg.get("sidefileoutputdir", self.DEFAULTS["SideFileOutputDir"])
-        ts = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
         if cfg.get("writesidefile", self.DEFAULTS["WriteSideFile"]).strip().lower() == "true":
-            os.makedirs(out_dir, exist_ok=True)
-            self._side_file_path = os.path.join(out_dir, f"consistency_out_{ts}_pid{os.getpid()}.csv")
+            self._side_file_path = onair_session.side_file("consistency", out_dir, "consistency_out")
         if cfg.get("writeincidentfile", self.DEFAULTS["WriteIncidentFile"]).strip().lower() == "true":
-            os.makedirs(out_dir, exist_ok=True)
-            self._incident_file_path = os.path.join(out_dir, f"consistency_incident_{ts}_pid{os.getpid()}.csv")
+            self._incident_file_path = onair_session.side_file("consistency_incident", out_dir, "consistency_incident")
 
         watched_note = (f"{len(self._candidates)} counter-named candidates"
                         if self._auto else f"{len(self._watched)} forced")

@@ -15,9 +15,10 @@ import os
 import socket
 from datetime import datetime
 from onair.src.ai_components.ai_plugin_abstract.ai_plugin import AIPlugin
+from onair.src.util import session as onair_session
 
 
-PLUGIN_VERSION = "csv_output@1.2"
+PLUGIN_VERSION = "csv_output@1.3"
 
 
 def _stringify(value):
@@ -104,7 +105,12 @@ class Plugin(AIPlugin):
         # Schema fingerprint + container info for the metadata sidecar.
         self._meta_extras = self._build_meta_extras()
 
-        os.makedirs(self.output_dir, exist_ok=True)
+        # With [SESSION] SessionsDir set, the frames go to <session>/raw.csv and
+        # OutputDir / FilenameTemplate are ignored. Otherwise the legacy flat layout.
+        self._session = onair_session.current()
+        self._file_index = 0
+        if self._session is None:
+            os.makedirs(self.output_dir, exist_ok=True)
 
     @staticmethod
     def _load_config():
@@ -164,6 +170,11 @@ class Plugin(AIPlugin):
         return hashlib.sha256(payload).hexdigest()
 
     def _make_filename(self):
+        if getattr(self, '_session', None) is not None:
+            # raw.csv, then raw.2.csv, raw.3.csv ... only if LinesPerFile rotates (it should not).
+            self._file_index += 1
+            base = self._session.path('raw')
+            return base if self._file_index == 1 else base[:-4] + f'.{self._file_index}.csv'
         # Microsecond precision so a rapid rotation cycle (e.g. small
         # LinesPerFile in tests, or a high-throughput scenario) cannot
         # produce two files with the same name within the same process.
@@ -189,6 +200,13 @@ class Plugin(AIPlugin):
             else self.file_name + '.meta.json'
         with open(meta_path, 'w') as f:
             json.dump(meta, f, indent=2)
+        if getattr(self, '_session', None) is not None and self._file_index == 1:
+            self._session.register('raw', self.file_name, schema={
+                'recorded_sha256': meta['recorded_schema_sha256'],
+                'n_cols': meta['kept_columns_count'],
+                'tlm_sha256': meta.get('schema_sha256'),
+            })
+            self._session.register('raw_meta', meta_path)
 
     def update(self, low_level_data=[], high_level_data={}):
         """Stage one telemetry frame; high-level plugin names are appended to headers once.

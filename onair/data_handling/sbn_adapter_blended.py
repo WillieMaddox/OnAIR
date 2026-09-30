@@ -103,9 +103,10 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import onair.data_handling.sbn_adapter as sbn_adapter
+from onair.src.util import session as onair_session
 
 
-ADAPTER_VERSION = "sbn_adapter_blended@1.2"
+ADAPTER_VERSION = "sbn_adapter_blended@1.3"
 
 # ⚠ A REAL per-row timestamp, stamped when the frame is read.
 #
@@ -380,7 +381,8 @@ class BlendedCsvWriter:
     frame from the live path.
     """
 
-    def __init__(self, headers, output_dir, filename_template, exclude_columns, meta_extras=None, flush_every=1):
+    def __init__(self, headers, output_dir, filename_template, exclude_columns, meta_extras=None, flush_every=1,
+                 fixed_path=None, on_open=None):
         self.headers = list(headers)
         self.exclude_columns = set(exclude_columns or ())
         self.keep_indices = [i for i, h in enumerate(self.headers)
@@ -395,9 +397,15 @@ class BlendedCsvWriter:
         self.rows = 0
         self._fh = None
         self._w = None
-        os.makedirs(self.output_dir, exist_ok=True)
+        # In a session the file is <session>/blended.csv and output_dir is unused.
+        self.fixed_path = fixed_path
+        self.on_open = on_open
+        if fixed_path is None:
+            os.makedirs(self.output_dir, exist_ok=True)
 
     def _make_filename(self):
+        if self.fixed_path is not None:
+            return self.fixed_path
         ts = datetime.now().strftime('%Y-%m-%dT%H-%M-%S-%f')
         name = self.filename_template.format(timestamp=ts, pid=self.pid) + '.csv'
         return os.path.join(self.output_dir, name)
@@ -426,6 +434,7 @@ class BlendedCsvWriter:
             else self.file_name + '.meta.json'
         with open(path, 'w') as f:
             json.dump(meta, f, indent=2)
+        return path
 
     def write(self, svals):
         """Append one already-stringified frame."""
@@ -435,7 +444,10 @@ class BlendedCsvWriter:
             self._w = csv.writer(self._fh)
             self._w.writerow(self.filtered_headers)
             self._fh.flush()
-            self._write_meta_sidecar()
+            meta_path = self._write_meta_sidecar()
+            if self.on_open is not None:
+                self.on_open(self.file_name, meta_path, self.recorded_schema_sha256(),
+                             len(self.filtered_headers))
         self._w.writerow([svals[i] for i in self.keep_indices])
         self.rows += 1
         if self.rows % self.flush_every == 0:
@@ -521,9 +533,10 @@ class ArrivalMeter:
     previous one and appends one JSON line to `arrivals_<ts>_pid<N>.jsonl`.
     """
 
-    def __init__(self, every_s, output_dir, clock=time.monotonic):
+    def __init__(self, every_s, output_dir, clock=time.monotonic, fixed_path=None):
         self.every_s = float(every_s)
         self.output_dir = output_dir
+        self.fixed_path = fixed_path          # <session>/arrivals.jsonl
         self.clock = clock
         self.pid = os.getpid()
         self.file_name = None
@@ -584,7 +597,9 @@ class ArrivalMeter:
                 'window_s': round(window, 3), 'packets': packets}
 
     def write(self, snap):
-        if self.file_name is None:
+        if self.file_name is None and self.fixed_path is not None:
+            self.file_name = self.fixed_path
+        elif self.file_name is None:
             os.makedirs(self.output_dir, exist_ok=True)
             ts = datetime.now().strftime('%Y-%m-%dT%H-%M-%S-%f')
             self.file_name = os.path.join(self.output_dir, f"arrivals_{ts}_pid{self.pid}.jsonl")
@@ -713,6 +728,9 @@ class DataSource(sbn_adapter.DataSource):
         # Read before super().__init__ — it calls connect(), which starts the
         # listener thread, and nothing below should race that.
         self._cfg = load_adapter_config()
+        # Claim this launch's session before anything writes a file. Inert (None)
+        # unless [SESSION] SessionsDir is set; every plugin then writes into the same directory.
+        self._session = onair_session.claim()
         self._stamp_frames = str(
             self._cfg.get('frametimestamp', 'true')).strip().lower() == 'true'
         self._ts_idx = None
@@ -761,7 +779,9 @@ class DataSource(sbn_adapter.DataSource):
         self._arrivals = ArrivalMeter(
             arrival_every,
             resolve_arrival_dir(self._cfg.get('arrivaloutputdir'),
-                                self._cfg.get('outputdir'))) if arrival_every > 0 else None
+                                self._cfg.get('outputdir')),
+            fixed_path=(self._session.path('arrivals') if self._session else None),
+        ) if arrival_every > 0 else None
 
         super().__init__(data_file, meta_file, ss_breakdown)
 
@@ -771,7 +791,17 @@ class DataSource(sbn_adapter.DataSource):
                   f"{self._arrivals.output_dir}")
 
         print(f"[sbn_adapter_blended] {ADAPTER_VERSION} BlendMode={self.blend_mode}")
-        if self.blend_mode == 'inline':
+        if self._session is not None:
+            self._session.update({'onair': {
+                'adapter_version': ADAPTER_VERSION, 'blend_mode': self.blend_mode,
+                'frame_interval_ms': int(round(self._frame_interval_s * 1000)),
+                'arrival_report_every_s': arrival_every}})
+            if self.blend_mode == 'inline':
+                print("[sbn_adapter_blended] ⚠ WARNING: BlendMode=inline in a session: no "
+                      "blended.csv is written; the blended frames are recorded only if the "
+                      "csv_output plugin is enabled, and then as raw.csv. session.json records "
+                      "blend_mode=inline so a loader can tell.")
+        if self.blend_mode == 'inline' and self._session is None:
             # In inline mode csv_output records the BLENDED stream. The
             # DIRECTORY is what marks data as blended, so if OutputDir still
             # points at the raw csv/ dir the corpus would carry blended frames
@@ -871,6 +901,14 @@ class DataSource(sbn_adapter.DataSource):
 
         excl = {c.strip() for c in str(self._cfg.get('excludecolumns', '')).split(',') if c.strip()}
         out_dir = resolve_blended_dir(self._cfg.get('blendedoutputdir'), self._cfg.get('outputdir'))
+        session = getattr(self, '_session', None)
+
+        def _on_open(csv_path, meta_path, recorded_sha, n_cols):
+            session.register('blended', csv_path, schema={
+                'recorded_sha256': recorded_sha, 'n_cols': n_cols,
+                'tlm_sha256': self._cfg.get('schema_sha256')})
+            session.register('blended_meta', meta_path)
+
         self._writer = BlendedCsvWriter(
             headers=headers,
             output_dir=out_dir,
@@ -891,6 +929,8 @@ class DataSource(sbn_adapter.DataSource):
                 'transform_source': 'native (sbn_adapter_blended)',
                 'buffer_assignment': 'authoritative (double_buffer_read_index)',
             },
+            fixed_path=(session.path('blended') if session else None),
+            on_open=(_on_open if session else None),
         )
         print(f"[sbn_adapter_blended] blended stream -> {self._writer._make_filename()} (template)")
 

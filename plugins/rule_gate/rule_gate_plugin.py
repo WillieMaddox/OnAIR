@@ -136,12 +136,12 @@ from __future__ import annotations
 
 import configparser
 import csv
-import datetime
 import os
 import re
 import sys as _sys
 
 from onair.src.ai_components.ai_plugin_abstract.ai_plugin import AIPlugin
+from onair.src.util import session as onair_session
 
 # Reuse the incident aggregator (AINOS3-25) that ships in the sibling
 # xgb_classifier plugin package, so rule-gate alerts fold into the SAME Incident
@@ -594,13 +594,10 @@ class Plugin(AIPlugin):
         self._side_file_header_written = False
         self._side_file_flush_every = _int("SideFileFlushEvery")
         out_dir = cfg.get("sidefileoutputdir", self.DEFAULTS["SideFileOutputDir"])
-        ts = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
         if cfg.get("writesidefile", self.DEFAULTS["WriteSideFile"]).strip().lower() == "true":
-            os.makedirs(out_dir, exist_ok=True)
-            self._side_file_path = os.path.join(out_dir, f"rule_gate_out_{ts}_pid{os.getpid()}.csv")
+            self._side_file_path = onair_session.side_file("rule_gate", out_dir, "rule_gate_out")
         if cfg.get("writeincidentfile", self.DEFAULTS["WriteIncidentFile"]).strip().lower() == "true":
-            os.makedirs(out_dir, exist_ok=True)
-            self._incident_file_path = os.path.join(out_dir, f"rule_gate_incident_{ts}_pid{os.getpid()}.csv")
+            self._incident_file_path = onair_session.side_file("rule_gate_incident", out_dir, "rule_gate_incident")
 
         print(f"[rule_gate] watching {len(self._enable_idx)} DeviceEnabled flags, "
               f"{len(self._cmderr_idx)} cmd-err counters, "
