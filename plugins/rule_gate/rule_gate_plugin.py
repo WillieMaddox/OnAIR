@@ -178,7 +178,7 @@ _TECH_LABEL = {
                           "farming the detector's post-switch blind window (DE-0005)",
 }
 
-# ADCS_GNC.Mode codes (components/onair/training/scenarios/cmd.py).
+# ADCS_GNC.Mode codes (ainos3 repo: ainos3/collect/commander.py).
 _ADCS_MODE_NAME = {0: "PASSIVE", 1: "BDOT", 2: "SUNSAFE", 3: "INERTIAL"}
 
 

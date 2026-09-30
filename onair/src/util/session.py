@@ -1,6 +1,6 @@
 """One directory per OnAIR session — the OnAIR half of the contract.
 
-The other half is `ainos3/training/scenarios/sessions.py`; the two share the file layout and the
+The other half is `ainos3/ainos3/lib/sessions.py`; the two share the file layout and the
 session.json format and must stay in step.
 
 At startup the data source (sbn_adapter_blended) calls `claim()`. If the ini sets
